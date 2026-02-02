@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import pyro
 from pyro.nn import PyroModule, PyroSample
+from torch.utils.data import DataLoader, TensorDataset
 import pyro.distributions as dist
 from pyro.infer.autoguide import AutoNormal
 from pyro.infer import SVI, Trace_ELBO, Predictive
@@ -10,6 +11,9 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from pyro.nn import PyroModule, PyroSample, PyroModuleList # Import this
+
+
+num_segment = 3  # Number of sections/segments
 
 # ==========================================
 # 1. DATA PRE-PROCESSING (The "Slicer")
@@ -36,7 +40,9 @@ def process_raw_data(file_path):
     # --- 2. Select the 33 Columns (Indices 0 to 32) ---
     # We use iloc (Integer Location) to grab columns 0 through 33.
     # Note: 0:38 in Python excludes 33, so it gets 0-32.
-    df_subset = df.iloc[:, 0:33]
+    end = 12 + num_segment + 1 + (num_segment * 4)  # 12 + 4 + 1 + 16 = 33
+    #df_subset = df.iloc[:, 0:33]
+    df_subset = df.iloc[:, 0:end]
 
     # --- 3. Clean the Data ---
     # Drop rows that contain ANY missing values (NaN) to prevent crashes
@@ -64,17 +70,20 @@ def process_raw_data(file_path):
     
     # --- 2. Targets (Indices 12-16) ---
     # These are the actual travel times for the 4 sections
-    y_sections = data[:, 12:16] 
+    #y_sections = data[:, 12:16] 
+    y_sections = data[:, 12:12+num_segment]
     
     # (Index 16 is Total Time, we don't strictly need it for training 
     #  since we train on sections, but you can keep it for validation)
     
     # --- 3. Local Features (Indices 17-32) ---
     # Total 20 columns. We assume 5 sections * 4 features.
-    raw_local = data[:, 17:33]
+    #raw_local = data[:, 17:33]
+    raw_local = data[:, 12+num_segment:12+num_segment+(num_segment*4)]
     
     # Reshape into [Batch, 5 Sections, 4 Features]
-    x_local = raw_local.view(-1, 4, 4)
+    #x_local = raw_local.view(-1, 4, 4)
+    x_local = raw_local.view(-1, num_segment, 4)
     
     # --- 4. Apply Logarithm Encoding ---
     # User Requirement: "N+0 need logarithm encoding"
@@ -90,7 +99,7 @@ def process_raw_data(file_path):
 # 2. THE WATERFALL BNN MODEL
 # ==========================================
 class SectionalWaterfallBNN(PyroModule):
-    def __init__(self, num_sections=4, global_dim=12, local_dim=4, hidden_dim=32):
+    def __init__(self, num_sections=num_segment, global_dim=12, local_dim=4, hidden_dim=8):
         super().__init__()
         self.num_sections = num_sections
         
@@ -105,14 +114,14 @@ class SectionalWaterfallBNN(PyroModule):
             # The Brain for this section
             block = PyroModule()
             block.linear1 = PyroModule[nn.Linear](input_dim, hidden_dim)
-            #block.linear2 = PyroModule[nn.Linear](hidden_dim, hidden_dim)
+            block.linear2 = PyroModule[nn.Linear](hidden_dim, hidden_dim)
             
             # --- SET PRIORS FOR BLOCK LAYERS (Full Bayesian) ---
             block.linear1.weight = PyroSample(dist.Normal(0., 1.).expand([hidden_dim, input_dim]).to_event(2))
             block.linear1.bias = PyroSample(dist.Normal(0., 1.).expand([hidden_dim]).to_event(1))
             
-            #block.linear2.weight = PyroSample(dist.Normal(0., 1.).expand([hidden_dim, hidden_dim]).to_event(2))
-            #block.linear2.bias = PyroSample(dist.Normal(0., 1.).expand([hidden_dim]).to_event(1))
+            block.linear2.weight = PyroSample(dist.Normal(0., 1.).expand([hidden_dim, hidden_dim]).to_event(2))
+            block.linear2.bias = PyroSample(dist.Normal(0., 1.).expand([hidden_dim]).to_event(1))
             
             # 2. Define the Bayesian Head
             head = PyroModule[nn.Linear](hidden_dim, 3) 
@@ -212,7 +221,7 @@ if __name__ == "__main__":
     
     # Combine into one big [N, 38] array like your source
     full_raw_data = np.hstack([raw_global, raw_targets, raw_total, raw_local])
-    file_path = "trip_info.xlsx"  # Using the array directly for this example
+    file_path = "trip_info3.xlsx"  # Using the array directly for this example
     
     # --- B. Preprocess ---
     print("Preprocessing...")
@@ -241,47 +250,116 @@ if __name__ == "__main__":
     print(f"訓練集樣本數: {len(train_idx)}, 驗證集樣本數: {len(val_idx)}")
 
     # --- C. Setup Model & Training ---
-    bnn_model = SectionalWaterfallBNN(num_sections=4, global_dim=12, local_dim=4)
+    bnn_model = SectionalWaterfallBNN(num_sections=num_segment, global_dim=12, local_dim=4)
     guide = AutoNormal(model_fn)
-    optimizer = pyro.optim.Adam({"lr": 0.01})
+    optimizer = pyro.optim.Adam({"lr": 0.005})
     svi = SVI(model_fn, guide, optimizer, loss=Trace_ELBO())
 
     print("\n--- Starting Training ---")
     pyro.clear_param_store()
-    epochs = 200
+    epochs = 90
     
     pbar = tqdm(range(epochs))
-    for epoch in pbar:
-        loss = svi.step(x_g_train, x_l_train, y_train)
-        pbar.set_description(f"Loss: {loss:.2f}")
+    #for epoch in pbar:
+    #    loss = svi.step(x_g_train, x_l_train, y_train)
+    #    pbar.set_description(f"Loss: {loss:.2f}")
+    train_dataset = TensorDataset(x_g_train, x_l_train, y_train)
+    train_loader = DataLoader(train_dataset, batch_size=150, shuffle=True)
+
+    # Training loop
+    for epoch in range(epochs):
+        epoch_loss = 0
+        for x_g_batch, x_l_batch, y_batch in train_loader:
+            loss = svi.step(x_g_batch, x_l_batch, y_batch)
+            epoch_loss += loss
+        print(f"Epoch {epoch}: Loss = {epoch_loss/len(train_loader):.2f}")
+        avg_train_loss = epoch_loss / len(train_loader)
+        # ===== VALIDATION PHASE =====
+        # Create validation dataloader
+        val_dataset = TensorDataset(x_g_val, x_l_val, y_val)
+        val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
+    
+        val_loss = 0
+        for x_g_val_batch, x_l_val_batch, y_val_batch in val_loader:
+            # Use evaluate_loss (no gradient updates)
+            loss = svi.evaluate_loss(x_g_val_batch, x_l_val_batch, y_val_batch)
+            val_loss += loss
+    
+        avg_val_loss = val_loss / len(val_loader)
+    
+        # Print both losses
+        print(f"Epoch {epoch}: Train Loss = {avg_train_loss:.2f}, Val Loss = {avg_val_loss:.2f}")
 
     # --- D. Inference (Prediction) ---
     print("\n--- Final Prediction Test ---")
-    # Take the first item to predict
-    test_x_g = x_g_train[0:1]
-    test_x_l = x_l_train[0:1]
     
-    # Run Monte Carlo Sampling (50 times)
-    predictive = Predictive(model_fn, guide=guide, num_samples=50)
-    samples = predictive(test_x_g, test_x_l)
+    val_dataset = TensorDataset(x_g_val, x_l_val, y_val)
+    val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
     
-    # Calculate Total ETA
-    #total_time_samples = torch.zeros(50, 1)
-    total_time_samples = torch.zeros(50)
+    val_loss = 0
+    for x_g_val_batch, x_l_val_batch, y_val_batch in val_loader:
+        # Use evaluate_loss (no gradient updates)
+        loss = svi.evaluate_loss(x_g_val_batch, x_l_val_batch, y_val_batch)
+        val_loss += loss
     
-    print("Predicted Section Times:")
-    for i in range(5):
-        # Get samples for this section
-        sec_samples = samples[f"obs_section_{i}"].squeeze()
-        mean_t = sec_samples.mean().item()
-        actual_t = y_train[0, i].item()
-        print(f"  Section {i}: Pred {mean_t:.2f} | Actual {actual_t:.2f}")
+    avg_val_loss = val_loss / len(val_loader)
+    
+    # Print both losses
+    print(f"Epoch {epoch}: Train Loss = {avg_train_loss:.2f}, Val Loss = {avg_val_loss:.2f}")
+    
+    
+    within_bound_count = 0
+    number_of_ratio = 0
+    section_within_bound_counts = 0 
+    
+    for j in range(len(x_g_val)):
+    
+        # Take the first item to predict
+        val_x_g = x_g_val[j:j+1]
+        val_x_l = x_l_val[j:j+1]
+    
+        # Run Monte Carlo Sampling (50 times)
+        predictive = Predictive(model_fn, guide=guide, num_samples=50)
+        samples = predictive(val_x_g, val_x_l)
+    
+        # Calculate Total ETA
+        #total_time_samples = torch.zeros(50, 1)
+        total_time_samples = torch.zeros(50)
+    
+        print("Predicted Section Times:")
+        trip_section_within_bound_counts = 0
+        for i in range(num_segment):
+            # Get samples for this section
+            sec_samples = samples[f"obs_section_{i}"].squeeze()
+            mean_t = sec_samples.mean().item()
+            actual_t = y_val[j, i].item()
+            print(f"  Section {i}: Pred {mean_t:.2f} | Actual {actual_t:.2f} | Conf +/- {sec_samples.std().item():.2f}")
+
+            total_time_samples += sec_samples
+            
+            if actual_t >= mean_t - sec_samples.std().item() and actual_t <= mean_t + sec_samples.std().item():
+                trip_section_within_bound_counts += 1
+        section_within_bound_counts += trip_section_within_bound_counts
+
+        final_mean = total_time_samples.mean().item()
+        final_std = total_time_samples.std().item()
+        actual_total = y_val[j].sum().item()
         
-        total_time_samples += sec_samples
+        
+        if actual_total >= final_mean - final_std and actual_total <= final_mean + final_std:
+            within_bound_count += 1
+        if final_std > 0:
+            number_of_ratio += final_mean/final_std
 
-    final_mean = total_time_samples.mean().item()
-    final_std = total_time_samples.std().item()
-    actual_total = y_train[0].sum().item()
-
-    print(f"\nTotal ETA: {final_mean:.2f} mins (Actual: {actual_total:.2f})")
-    print(f"Confidence: +/- {final_std:.2f} mins")
+        print(f"\nTotal ETA: {final_mean:.2f} seconds (Actual: {actual_total:.2f})")
+        print(f"\nWithin Bound? : {'YES' if (actual_total >= final_mean - final_std and actual_total <= final_mean + final_std) else 'NO'}")
+        print(f"Confidence: +/- {final_std:.2f} seconds")
+        print(f"Confidence Level: {final_mean/final_std if actual_total>0 else 0}")
+        print(f"\n\n")
+        
+        print(f"總共 {len(x_g_val)} 筆驗證資料中，有 {within_bound_count} 筆落在預測區間內。")
+        print(f"平均 {num_segment} Section，有 {section_within_bound_counts/len(x_g_val)} section 落在預測區間內。")
+        print(f"平均置信度指標: {number_of_ratio/len(x_g_val)}")
+    
+    
+    
