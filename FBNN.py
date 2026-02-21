@@ -112,6 +112,7 @@ class SectionalWaterfallBNN(PyroModule):
             nn.Parameter(torch.tensor(0.1)) for _ in range(num_sections)
         ])
         for i in range(num_sections):
+            # pyro module is the same as nn.Module but supports priors
             block = PyroModule()
             block.linear1 = PyroModule[nn.Linear](input_dim, hidden_dim)
             block.linear2 = PyroModule[nn.Linear](hidden_dim, hidden_dim)
@@ -145,7 +146,7 @@ class SectionalWaterfallBNN(PyroModule):
             h = self.blocks[i].linear1(x_input)
             h = torch.relu(h)
             
-            # Add Bayesian noise to activations
+            # Add Bayesian noise to activations, for rombustness
             if self.training or True:  # Always apply for full Bayesian
                 noise_scale = torch.nn.functional.softplus(self.activation_noise_scales[i])
                 noise = torch.randn_like(h) * noise_scale
@@ -206,17 +207,6 @@ if __name__ == "__main__":
     print("Generating dummy data...")
     N_SAMPLES = 500
     
-    # Indices 0-11: Global
-    raw_global = np.random.randn(N_SAMPLES, 12)
-    # Indices 12-15: Targets (Section Times, e.g., around 5 mins)
-    raw_targets = np.abs(np.random.randn(N_SAMPLES, 4) + 0.0)
-    # Index 16: Total Time
-    raw_total = np.sum(raw_targets, axis=1, keepdims=True)
-    # Indices 17-32: Local Features (Assuming raw positive values for log transform)
-    raw_local = np.abs(np.random.randn(N_SAMPLES, 20) * 10) 
-    
-    # Combine into one big [N, 38] array like your source
-    full_raw_data = np.hstack([raw_global, raw_targets, raw_total, raw_local])
     file_path = "trip_info3.xlsx"  # Using the array directly for this example
     
     # --- B. Preprocess ---
@@ -255,7 +245,7 @@ if __name__ == "__main__":
     pyro.clear_param_store()
     epochs = 90
     
-    pbar = tqdm(range(epochs))
+    #pbar = tqdm(range(epochs))
     #for epoch in pbar:
     #    loss = svi.step(x_g_train, x_l_train, y_train)
     #    pbar.set_description(f"Loss: {loss:.2f}")
