@@ -170,33 +170,36 @@ class MatrixGNN(PyroModule):
         # --- Output Heads ---
         final_dim = hidden_dim
         
-        self.heads_loc = PyroModuleList([])
-        self.heads_scale = PyroModuleList([])
-        self.heads_df = PyroModuleList([])
+        self.heads_loc = PyroModuleList([PyroModuleList([]) for _ in range(self.num_layers + 1)])
+        self.heads_scale = PyroModuleList([PyroModuleList([]) for _ in range(self.num_layers + 1)])
+        self.heads_df = PyroModuleList([PyroModuleList([]) for _ in range(self.num_layers + 1)])
         self.exit_gates = PyroModuleList([])
         
+        
         self.num_layer = num_sections*2
+        
+        for layer_i in range(self.num_layers + 1):
+            for sec_i in range(num_sections):
+                # Loc Head (Wide prior)
+                h_loc = PyroModule[nn.Linear](hidden_dim, 1)
+                h_loc.weight = PyroSample(dist.Normal(0., 2.0).expand([1, hidden_dim]).to_event(2))
+                h_loc.bias = PyroSample(dist.Normal(0., 1.0).expand([1]).to_event(1))
+                self.heads_loc[layer_i].append(h_loc)
+                
+                # Scale Head 
+                h_scale = PyroModule[nn.Linear](hidden_dim, 1)
+                h_scale.weight = PyroSample(dist.Normal(0., 0.1).expand([1, hidden_dim]).to_event(2))
+                h_scale.bias = PyroSample(dist.Normal(-5., 1.0).expand([1]).to_event(1))
+                self.heads_scale[layer_i].append(h_scale)
+                
+                # DF Head
+                h_df = PyroModule[nn.Linear](hidden_dim, 1)
+                h_df.weight = PyroSample(dist.Normal(0., 0.1).expand([1, hidden_dim]).to_event(2))
+                h_df.bias = PyroSample(dist.Normal(2., 0.5).expand([1]).to_event(1))
+                self.heads_df[layer_i].append(h_df)
+        
+        
         for i in range(self.num_layer):
-            loc_std_dev = 2
-            
-            # Loc Head
-            h_loc = PyroModule[nn.Linear](final_dim, 1)
-            h_loc.weight = PyroSample(dist.Normal(0., loc_std_dev).expand([1, final_dim]).to_event(2))
-            h_loc.bias = PyroSample(dist.Normal(0., 2.0).expand([1]).to_event(1))
-            self.heads_loc.append(h_loc)
-            
-            # Scale Head
-            h_scale = PyroModule[nn.Linear](final_dim, 1)
-            h_scale.weight = PyroSample(dist.Normal(0., 0.1).expand([1, final_dim]).to_event(2))
-            h_scale.bias = PyroSample(dist.Normal(5., 5.0).expand([1]).to_event(1)) 
-            self.heads_scale.append(h_scale)
-            
-            # DF Head
-            h_df = PyroModule[nn.Linear](final_dim, 1)
-            h_df.weight = PyroSample(dist.Normal(0., 0.2).expand([1, final_dim]).to_event(2))
-            h_df.bias = PyroSample(dist.Normal(2., 0.5).expand([1]).to_event(1))
-            self.heads_df.append(h_df)
-            
             # Exit Gate
             # Prior: Bias towards 0.5 (Neutral)
             gate_input_dim = hidden_dim + 2 
@@ -208,30 +211,17 @@ class MatrixGNN(PyroModule):
         
     
     def predict_step(self, h_current, layer_idx):
-        all_locs, all_scales, all_dfs, all_gates_scores = [], [], [], []
-        
+        locs, scales, dfs = [], [], []
         for i in range(self.num_sections):
-            # GET RID OF EARLY EXIT: Only use h_current[i]
-            final_feat = h_current[i] 
+            feat = h_current[i] 
+            loc = self.heads_loc[layer_idx][i](feat)
+            scale = torch.nn.functional.softplus(self.heads_scale[layer_idx][i](feat)) * 0.05 + 1e-3
+            df = torch.nn.functional.softplus(self.heads_df[layer_idx][i](feat)) + 2.5
             
-            head_idx = layer_idx * self.num_sections + i
-            loc = self.heads_loc[i](final_feat)
-            scale = torch.nn.functional.softplus(self.heads_scale[i](final_feat)) * 0.05 + 1e-3 #0.05
-            df = torch.nn.functional.softplus(self.heads_df[i](final_feat)) + 2.5
-            
-            # 2. Smart Gating
-            # Concatenate [Features, Mean, Variance]
-            # Detach loc/scale so the gate doesn't sabotage predictions to make gating easier
-            gate_input = torch.cat([final_feat, loc.detach(), scale.detach()], dim=1)
-            
-            g_logit = self.exit_gates[i](gate_input)
-            g_score = torch.sigmoid(g_logit)
-            
-            all_locs.append(loc)
-            all_scales.append(scale)
-            all_dfs.append(df)
-            all_gates_scores.append(g_score)
-        return (all_locs, all_scales, all_dfs), all_gates_scores
+            locs.append(loc)
+            scales.append(scale)
+            dfs.append(df)
+        return locs, scales, dfs
             
 
     def forward(self, global_features, all_sections_data):
@@ -248,55 +238,18 @@ class MatrixGNN(PyroModule):
             
         h_current = self.embedding_layer(inputs_list)
         
-        all_layer_prediction = [] 
-        all_layer_gate_scores = []
+        all_layer_preds = [] 
         
-        # 1. Layer 0 (Local Input)
-        preds, gates = self.predict_step(h_current, layer_idx=0)
-        all_layer_prediction.append(preds)
-        all_layer_gate_scores.append(gates)
+        # Layer 0
+        all_layer_preds.append(self.predict_step(h_current, layer_idx=0))
 
-        
-            
-        # 2. Propagation Layers
-        for layer_idx_prop, layer in enumerate(self.prop_layers):
+        # Layers 1 to 9
+        for idx, layer in enumerate(self.prop_layers):
             h_current = layer(h_current)
-            predictions, gates = self.predict_step(h_current, layer_idx=layer_idx_prop + 1)
-            all_layer_prediction.append(predictions)
-            all_layer_gate_scores.append(gates)
-        
-        
-        # --- RECURSIVE SOFT-CONDITIONAL OUTPUT (Differentiable Branching) ---
-        # Formula: Output_b = Gate_b * Output_b + (1 - Gate_b) * Output_b+1
-        
-        # Base case: The deepest layer (assumes Gate = 1.0, must exit here)
-        final_locs, final_scales, final_dfs = all_layer_prediction[-1]
-        
-        # Track gates for the loss function (for the Predictive logger later)
-        tracked_gates = [all_layer_gate_scores[-1]] 
-        
-        # Loop backwards
-        for layer_idx in range(len(all_layer_prediction) - 2, -1, -1):
-            curr_locs, curr_scales, curr_dfs = all_layer_prediction[layer_idx]
-            curr_gates = all_layer_gate_scores[layer_idx]
-            tracked_gates.insert(0, curr_gates)
+            all_layer_preds.append(self.predict_step(h_current, layer_idx=idx+1))
             
-            new_locs, new_scales, new_dfs = [], [], []
-            for sec_i in range(self.num_sections):
-                g = curr_gates[sec_i] 
-                
-                # Blend
-                c_loc = g * curr_locs[sec_i] + (1 - g) * final_locs[sec_i]#.detach()
-                c_scale = g * curr_scales[sec_i] + (1 - g) * final_scales[sec_i]#.detach()
-                c_df = g * curr_dfs[sec_i] + (1 - g) * final_dfs[sec_i]#.detach()
-                
-                new_locs.append(c_loc)
-                new_scales.append(c_scale)
-                new_dfs.append(c_df)
-                
-            final_locs, final_scales, final_dfs = new_locs, new_scales, new_dfs
-
-        return (final_locs, final_scales, final_dfs), tracked_gates
+        # Return a simple list of predictions for every layer
+        return all_layer_preds
         
         
         # 3. Heads (Early Exit) 
