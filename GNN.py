@@ -1,3 +1,5 @@
+import statistics
+
 import torch
 import torch.nn as nn
 import pyro
@@ -221,7 +223,7 @@ if __name__ == "__main__":
     
     idx = np.arange(x_global_all.shape[0])
     train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42)
-    
+    in_range = 0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     x_global_train = x_global_all[train_idx].to(device)
@@ -257,10 +259,10 @@ if __name__ == "__main__":
 
 
     print("\n--- Starting Training ---")
-    epochs = 50
+    epochs = 400
     
     train_dataset = TensorDataset(x_global_train, x_local_train, y_train)
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True)
 
     for epoch in range(epochs):
         gnn_model.train()
@@ -294,7 +296,7 @@ if __name__ == "__main__":
     # --- D. Inference (Prediction) ---
     print("\n--- Final Prediction Test ---")
     gnn_model.eval()
-    
+    list_of_predict = []
     error_abs_total = 0
     error_total = 0
     
@@ -322,16 +324,26 @@ if __name__ == "__main__":
                     
             total_act = actual.sum()
             
+            list_of_predict.append(total_pred)
+            if len(list_of_predict) > 1:
+                prediction_std_deviation = statistics.pvariance(list_of_predict) ** 0.5
+            else:
+                prediction_std_deviation = 0.0
+            
             
             error_total += (total_act - total_pred)
             error_rate = error_total / (j+1) 
             error_abs_total += abs(total_act - total_pred)
             error_rate_squared = error_abs_total / (j+1) 
+            if abs(total_act - total_pred) < 73.3:
+                in_range += 1
 
             #if j < 10:
             print(f"  --> Total ETA: {total_pred:.1f}s (Actual: {total_act:.1f}s)")
             print(f"Error (Absolute): {error_rate_squared:.2f}s")
             print(f"Error Tendency (Bias): {error_rate:.2f}s")
+            print(f"Number in range: {in_range}")
+            print(f"\nPrediction Std Deviation: {prediction_std_deviation:.2f})")
             
         
             

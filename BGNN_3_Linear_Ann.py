@@ -4,6 +4,7 @@ from sklearn.discriminant_analysis import StandardScaler
 import torch
 import torch.nn as nn
 import pyro
+from annealing import Annealer
 from pyro.nn import PyroModule, PyroSample, PyroModuleList
 from torch.utils.data import DataLoader, TensorDataset
 import pyro.distributions as dist
@@ -95,7 +96,7 @@ class NeighborMixingLayer(PyroModule):
         self.device = device
         
         loc_self = torch.tensor(2., device=device)
-        loc_side = torch.tensor(0., device=device)
+        loc_side = torch.tensor(-2., device=device) #0
         scale = torch.tensor(0.5, device=device)
         
         zero = torch.tensor(0., device=device)
@@ -103,62 +104,52 @@ class NeighborMixingLayer(PyroModule):
         b_scale = torch.tensor(0.1, device=device)
 
         self.w_self = PyroSample(dist.Normal(loc_self, scale).expand([num_segments]).to_event(1))
-        self.w_left = PyroSample(dist.Normal(loc_side, scale).expand([num_segments]).to_event(1))
+        #self.w_left = PyroSample(dist.Normal(loc_side, scale).expand([num_segments]).to_event(1))
         self.w_right = PyroSample(dist.Normal(loc_side, scale).expand([num_segments]).to_event(1))
         
-        self.nets_1 = PyroModuleList([])
-        self.nets_2 = PyroModuleList([])
+        self.nets = PyroModuleList([])
         
-        he_std = (2.0 / (input_dim * 3)) ** 0.5
+        #he_std = (2.0 / (input_dim * 3)) ** 0.5
+        he_std = (2.0 / (input_dim * 2)) ** 0.5
         
         for i in range(num_segments):
             # Input size x3 because we concat [Self, Left, Right]
-            net_input_dim = input_dim * 3 
+            #net_input_dim = input_dim * 3 
+            net_input_dim = input_dim * 2
             net_1 = PyroModule[nn.Linear](net_input_dim, output_dim)
             net_1.weight = PyroSample(dist.Normal(zero, w_scale).expand([output_dim, net_input_dim]).to_event(2))
             
             net_1.bias = PyroSample(dist.Normal(zero, b_scale).expand([output_dim]).to_event(1))
-            self.nets_1.append(net_1)
+            self.nets.append(net_1)
     
-        self.dropout_1 = PyroModule[nn.Dropout](p=dropout_rate)
-        
-        for i in range(num_segments):
-            # Input size x3 because we concat [Self, Left, Right]
-            net_2 = PyroModule[nn.Linear](output_dim, output_dim)
-            net_2.weight = PyroSample(dist.Normal(0., 0.2).expand([output_dim, output_dim]).to_event(2))
-            
-            net_2.bias = PyroSample(dist.Normal(0., 0.1).expand([output_dim]).to_event(1))
-            self.nets_2.append(net_2)
-        
-        self.dropout_2 = PyroModule[nn.Dropout](p=dropout_rate)
+        self.dropout = PyroModule[nn.Dropout](p=dropout_rate)
 
     def forward(self, prev_layer_outputs):
         outputs = []
         for i in range(self.num_segments):
             # Apply individual weights using softmax to ensure positivity
-            ws = torch.nn.functional.softmax(self.w_self[i], dim=0)
-            wl = torch.nn.functional.softmax(self.w_left[i], dim=0)
-            wr = torch.nn.functional.softmax(self.w_right[i], dim=0)
-
+            #ws = torch.nn.functional.softmax(self.w_self[i], dim=0)
+            ws = torch.nn.functional.softplus(self.w_self[i])
+            #wl = torch.nn.functional.softplus(self.w_left[i])
+            wr = torch.nn.functional.softplus(self.w_right[i])
             self_feat = prev_layer_outputs[i] * ws
             
+            """
             if i > 0:
                 left_feat = prev_layer_outputs[i-1] * wl
             else:
                 left_feat = torch.zeros_like(self_feat)
-
+            """
             if i < self.num_segments - 1:
                 right_feat = prev_layer_outputs[i+1] * wr
             else:
                 right_feat = torch.zeros_like(self_feat)
 
-            combined = torch.cat([self_feat, left_feat, right_feat], dim=1)
+            #combined = torch.cat([self_feat, left_feat, right_feat], dim=1)
+            combined = torch.cat([self_feat, right_feat], dim=1)
             
-            out = self.nets_1[i](combined)
-            out = self.dropout_1(out) 
-            out = torch.nn.functional.silu(out)
-            out = self.nets_2[i](out)
-            out = self.dropout_2(out) 
+            out = self.nets[i](combined)
+            out = self.dropout(out) 
             out = torch.nn.functional.silu(out)
             outputs.append(out)
         return outputs
@@ -184,7 +175,7 @@ class MatrixGNN(PyroModule):
         # We create N layers. Each layer contains N unique networks.
         self.prop_layers = PyroModuleList([
             NeighborMixingLayer(hidden_dim, hidden_dim, num_sections, dropout_rate=0.2, device=device)
-            for _ in range(num_sections) # Layer depth = num_segments
+            for _ in range(3) # Layer depth = num_segments
         ])
         
         # --- Output Heads ---
@@ -272,7 +263,7 @@ class MatrixGNN(PyroModule):
 # ==========================================
 # 4. EXECUTION
 # ==========================================
-def model_fn(x_global, x_local, y_true=None, total_size=None):
+def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
     locs, scales, dfs = bnn_model(x_global, x_local)
     
     if total_size is None:
@@ -282,10 +273,11 @@ def model_fn(x_global, x_local, y_true=None, total_size=None):
         # --- THE FIX FOR STUCK PREDICTIONS ---
         # We scale the Likelihood by 100.0.
         # This tells the model: "Fitting the data is 100x more important than the Prior."
-        with pyro.poutine.scale(scale=100.0):
+        # Use kl_weight instead of 100.0!
+        with pyro.poutine.scale(scale=kl_weight):
             for i in range(len(locs)):
-                #dist_i = dist.StudentT(dfs[i].squeeze(), locs[i].squeeze(), scales[i].squeeze())
-                dist_i = dist.Normal(locs[i].squeeze(), scales[i].squeeze())
+                #dist_i = dist.Normal(locs[i].squeeze(), scales[i].squeeze())
+                dist_i = dist.StudentT(dfs[i].squeeze(), locs[i].squeeze(), scales[i].squeeze())
                 target = y_true[:, i] if y_true is not None else None
                 pyro.sample(f"obs_section_{i}", dist_i, obs=target)
 
@@ -304,9 +296,9 @@ if __name__ == "__main__":
     x_global_train = x_global_all[train_idx]
     x_local_train = x_local_all[train_idx]
     y_train = y_all[train_idx]
-    x_global_val = x_global_all[val_idx]
-    x_local_val = x_local_all[val_idx]
-    y_val = y_all[val_idx]
+    x_global_val = x_global_all[val_idx].to(device)
+    x_local_val = x_local_all[val_idx].to(device)
+    y_val = y_all[val_idx].to(device)
 
     # Initialize The Matrix Model
     bnn_model = MatrixGNN(num_sections=num_segment, global_dim=14, local_dim=4, hidden_dim=32, device=device).to(device)
@@ -327,27 +319,42 @@ if __name__ == "__main__":
 })
 
     svi = SVI(model_fn, guide, optimizer, loss=TraceMeanField_ELBO())
+    #svi = SVI(model_fn, guide, optimizer, loss=Trace_ELBO())
 
     print("\n--- Starting Training ---")
     pyro.clear_param_store()
-    epochs = 200
+    epochs = 2000
     
     train_dataset = TensorDataset(x_global_train, x_local_train, y_train)
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True)
     print(len(train_dataset))
     total_size = len(train_dataset)
     
     mae_calc = torch.nn.L1Loss()
-
+    annealing_constructor = Annealer(total_steps=500, shape='linear', baseline=0.0, maximum = 0.2, cyclical=True, disable=False)
+    #annealing_constructor = Annealer(total_steps=500, shape='linear', baseline=0.0, maximum = 1, cyclical=True, disable=False)
     for epoch in range(epochs):
         epoch_loss = 0
         epoch_mae = 0
         batches = 0
+        
+        # Calculate KL Annealing weight (goes from 0.0 to 1.0 over 50 epochs)
+        # current_kl_weight = min(1.0, (epoch + 1) / 50.0)      #3/6/1928
+        #current_kl_weight = min(0.1, (epoch + 1) / 100 * 0.05) #3/6/1058
+        #current_kl_weight = min(0.1, (epoch + 1) / 100 * 0.01)   # 3/7/1419
+        #current_kl_weight = min(0.1, (epoch + 1) / 100 * 0.05) #3/6/1058
+        #current_kl_weight = min(0.2, (epoch + 1) / 100 * 0.02) #3/6/1058
+        
+        current_kl_weight = annealing_constructor._slope() + 0.001
+        annealing_constructor.step() 
+         # Update the annealer's internal step count
         for x_g_batch, x_l_batch, y_batch in train_loader:
             x_g_batch = x_g_batch.to(device)
             x_l_batch = x_l_batch.to(device)
             y_batch = y_batch.to(device)
-            loss = svi.step(x_g_batch, x_l_batch, y_batch, total_size)
+            #loss = svi.step(x_g_batch, x_l_batch, y_batch, total_size)
+            # PASS BOTH total_size and kl_weight as keyword arguments
+            loss = svi.step(x_g_batch, x_l_batch, y_batch, total_size=total_size, kl_weight=current_kl_weight)
             epoch_loss += loss
             """
             with torch.no_grad():
@@ -356,7 +363,7 @@ if __name__ == "__main__":
                 epoch_mae += mae_calc(preds, y_batch).item()
             batches += 1
             """
-        print(f"Epoch {epoch}: ELBO {epoch_loss/len(train_loader):.2f}") #| MAE {epoch_mae/batches:.4f}")
+        print(f"Epoch {epoch}: ELBO {epoch_loss/len(train_loader):.2f} | KL Weight: {current_kl_weight:.2f}")
 
     
     print("\n--- Final Prediction Test ---")
@@ -373,8 +380,13 @@ if __name__ == "__main__":
     # ==========================================
     print("\n--- Final Prediction Test ---")
     list_of_predict = []
+    list_of_confidence = []
     list_of_actual = []
+    list_of_predict_sections = [[] for i in range(num_segment)]
+    list_of_confidence_sections = [[] for i in range(num_segment)]
+    list_of_actual_sections = [[] for i in range(num_segment)]
     predictive = Predictive(model_fn, guide=guide, num_samples=50)
+
     
     # Counters for accuracy
     total_samples = 0
@@ -386,18 +398,19 @@ if __name__ == "__main__":
     error_rate_squared = 0
     error_total = 0
     
-    for j in range(len(x_global_val)):
-        val_x_g = x_global_val[j:j+1].to(device)
-        val_x_l = x_local_val[j:j+1].to(device)
     
-        predictive = Predictive(model_fn, guide=guide, num_samples=50)
+    for j in range(len(x_global_val)):
+        val_x_g = x_global_val[j:j+1]
+        val_x_l = x_local_val[j:j+1]
+    
+        
         samples = predictive(val_x_g, val_x_l)
         
         pred_means_scaled = []
         pred_stds_scaled = []
         actuals_scaled = []
         
-        
+        total_trip_samples_real = torch.zeros(50, device=device)
         
         for i in range(num_segment):
             sec_samples = samples[f"obs_section_{i}"].squeeze()
@@ -414,36 +427,58 @@ if __name__ == "__main__":
         std_real = np.array(pred_stds_scaled) * scaler_y.scale_
         
         total_pred = 0
+        trip_section_within_bound = 0
         
         # 6. CREATE ACCUMULATOR ON DEVICE
-        total_time_samples = torch.zeros(50, device=device)
         
         print(f"\n--- Sample {j} ---")
-        trip_section_within_bound = 0
         for i in range(num_segment):
-            print(f"  Sec {i}: Pred {pred_real[i]:.1f}s | Actual {actual_real[i]:.1f}s | Conf +/- {std_real[i]:.1f}s")
+            list_of_predict_sections[i].append(pred_real[i])
+            if len(list_of_predict_sections[i]) > 1:
+                section_prediction_std_deviation = statistics.pvariance(list_of_predict_sections[i]) ** 0.5
+            else:
+                section_prediction_std_deviation = 0.0
+                
+            list_of_confidence_sections[i].append(std_real[i])
+            if len(list_of_confidence_sections[i]) > 1:
+                section_confidence_std_deviation = statistics.pvariance(list_of_confidence_sections[i]) ** 0.5
+            else:
+                section_confidence_std_deviation = 0.0
+                
+            list_of_actual_sections[i].append(actual_real[i])
+            if len(list_of_actual_sections[i]) > 1:
+                section_actual_std_deviation = statistics.pvariance(list_of_actual_sections[i]) ** 0.5
+            else:
+                section_actual_std_deviation = 0.0
+            
+            print(f"  Sec {i}: Pred {pred_real[i]:.1f}s | Actual {actual_real[i]:.1f}s | Conf +/- {std_real[i]:.1f}s | Prediction Dev {section_prediction_std_deviation:.1f}s | Confidence Dev {section_confidence_std_deviation:.1f}s | | Actual Dev {section_actual_std_deviation:.1f}s | Within Bound? {'YES' if (pred_real[i] - std_real[i]) <= actual_real[i] <= (pred_real[i] + std_real[i]) else 'NO'}")
             total_pred += pred_real[i]
             
+
             if actual_real[i] >= (pred_real[i] - std_real[i]) and actual_real[i] <= (pred_real[i] + std_real[i]):
                 trip_section_within_bound += 1
                 
         section_within_bound_counts += trip_section_within_bound
         
-        final_mean = total_time_samples.mean().item()
-        final_std = total_time_samples.std().item()
-        actual_total = y_val[j].sum().item()
+        final_mean = pred_real.sum()
+        
         
         total_act = actual_real.sum()
         total_std = np.sqrt(np.sum(std_real**2)) 
         
         if total_act >= (total_pred - total_std) and total_act <= (total_pred + total_std):
             within_bound_count += 1
-        list_of_predict.append(final_mean)
+        list_of_predict.append(total_pred)
         if len(list_of_predict) > 1:
             prediction_std_deviation = statistics.pvariance(list_of_predict) ** 0.5
         else:
             prediction_std_deviation = 0.0
-        list_of_actual.append(actual_total)
+        list_of_confidence.append(total_std)
+        if len(list_of_confidence) > 1:
+            confidence_std_deviation = statistics.pvariance(list_of_confidence) ** 0.5
+        else:
+            confidence_std_deviation = 0.0
+        list_of_actual.append(total_act)
         if len(list_of_actual) > 1:
             actual_std_deviation = statistics.pvariance(list_of_actual) ** 0.5
         else:
@@ -457,12 +492,11 @@ if __name__ == "__main__":
         error_abs_total += abs(total_act - total_pred)
         error_rate_squared = error_abs_total/(j+1) 
 
-        print(f"\nTotal ETA: {final_mean:.2f} seconds (Actual: {actual_total:.2f})")
-        print(f"\nWithin Bound? : {'YES' if (actual_total >= final_mean - final_std and actual_total <= final_mean + final_std) else 'NO'}")
-        print(f"Confidence: +/- {final_std:.2f} seconds")
-        print(f"Confidence Level: {final_mean/final_std if actual_total>0 else 0}")
-        print(f"\nPrediction Std Deviation: {prediction_std_deviation:.2f} , Actual Std Deviation: {actual_std_deviation:.2f})")
-        print(f"\nBound Std Deviation: {prediction_std_deviation:.2f} , Actual Std Deviation: {actual_std_deviation:.2f})")
+        print(f"\nTotal ETA: {total_pred:.2f} seconds (Actual: {total_act:.2f})")
+        print(f"\nWithin Bound? : {'YES' if (total_pred - total_std) <= total_act <= (total_pred + total_std) else 'NO'}")
+        print(f"Confidence: +/- {total_std:.2f} seconds")
+        print(f"Confidence Level: {total_pred/total_std if total_act>0 else 0}")
+        print(f"\nPrediction Std Deviation: {prediction_std_deviation:.2f} , Confidence Std Deviation: {confidence_std_deviation:.2f} , Actual Std Deviation: {actual_std_deviation:.2f})")
         print(f"Error: {error_rate_squared}")
         print(f"Error Tendency: {error_rate}")
         print(f"\n\n")

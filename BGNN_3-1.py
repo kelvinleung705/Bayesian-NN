@@ -1,3 +1,5 @@
+import statistics
+
 import torch
 import torch.nn as nn
 import pyro
@@ -331,6 +333,8 @@ if __name__ == "__main__":
     
     
     # --- D. Inference (Prediction) ---
+    list_of_predict = []
+    list_of_actual = []
     print("\n--- Final Prediction Test ---")
     
     # We can now process validation in larger batches without memory/shape errors
@@ -386,6 +390,10 @@ if __name__ == "__main__":
         
         if actual_total >= final_mean - final_std and actual_total <= final_mean + final_std:
             within_bound_count += 1
+        list_of_predict.append(final_mean)
+        prediction_variance = statistics.pvariance(list_of_predict)
+        list_of_actual.append(actual_total)
+        actual_variance = statistics.pvariance(list_of_actual)
         if final_std > 0:
             number_of_ratio += final_mean/final_std
         error_total += (actual_total - final_mean)
