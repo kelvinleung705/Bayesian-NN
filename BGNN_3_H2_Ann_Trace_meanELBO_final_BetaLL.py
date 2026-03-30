@@ -70,8 +70,9 @@ class LocalIsolationLayer(PyroModule):
             net = PyroModule[nn.Linear](input_dim, output_dim)
             zero = torch.tensor(0., device=device)
             point_one = torch.tensor(1, device=device)
-            net.weight = PyroSample(dist.Normal(zero, point_one).expand([output_dim, input_dim]).to_event(2))
-            net.bias = PyroSample(dist.Normal(zero, point_one).expand([output_dim]).to_event(1))
+            df = torch.tensor(15., device=device)
+            net.weight = PyroSample(dist.StudentT(df, zero, point_one).expand([output_dim, input_dim]).to_event(2))
+            net.bias = PyroSample(dist.StudentT(df, zero, point_one).expand([output_dim]).to_event(1))
             self.nets.append(net)
             
     def forward(self, x_inputs):
@@ -298,22 +299,25 @@ class MatrixGNN(PyroModule):
 # ==========================================
 # 4. EXECUTION
 # ==========================================
-def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0): #kl_weight=1
-    with pyro.poutine.scale(scale=kl_weight):
-        locs, scales, dfs = bnn_model(x_global, x_local)
+def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0): 
+    # 1. 正常運行模型，絕對不要在這裡使用 poutine.scale!
+    locs, scales, dfs = bnn_model(x_global, x_local)
     
     if total_size is None:
         total_size = x_global.shape[0]
     
+    # 2. 反向縮放因子 (Data Multiplier)
+    # 當 kl_weight 很小，數據的權重就會變得極大！
+    data_scale = 1.0 / kl_weight
+    
     with pyro.plate("data", size=total_size, subsample_size=x_global.shape[0], dim=-1):
-        # --- THE FIX FOR STUCK PREDICTIONS ---
-        # We scale the Likelihood by 100.0.
-        # This tells the model: "Fitting the data is 100x more important than the Prior."
-        # Use kl_weight instead of 100.0!
         for i in range(len(locs)):
             dist_i = dist.StudentT(dfs[i].squeeze(), locs[i].squeeze(), scales[i].squeeze())
             target = y_true[:, i] if y_true is not None else None
-            pyro.sample(f"obs_section_{i}", dist_i, obs=target)
+            
+            # 3. 只有這裡！只放大觀測數據的 Log-Likelihood
+            with pyro.poutine.scale(scale=data_scale):
+                pyro.sample(f"obs_section_{i}", dist_i, obs=target)
             
 def get_ll_kl(model_fn, guide, x_g, x_l, y, total_size, kl_weight):
     # Sample latent variables from guide
@@ -386,10 +390,12 @@ if __name__ == "__main__":
     bnn_model = MatrixGNN(num_sections=num_segment, global_dim=9, local_dim=4, hidden_dim=32, device=device).to(device)
     
     # Define Guide (Posterior approximation)
-    base_guide = AutoDiagonalNormal(model_fn).to(device)
-    def guide_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
+    guide = AutoDiagonalNormal(model_fn).to(device)
+    """
+    def guide_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=0.1):
         with pyro.poutine.scale(scale=kl_weight):
             return base_guide(x_global, x_local, y_true, total_size=total_size, kl_weight=kl_weight)
+    """
     
     # 3. PYRO OPTIMIZER & SCHEDULER (Fixed)
     CYCLE_LENGTH = 500  # Sync LR and KL cycles
@@ -411,7 +417,7 @@ if __name__ == "__main__":
     scheduler = PyroLRScheduler(scheduler_constructor, optimizer_args)
 
     # Initialize SVI with the wrapped scheduler
-    svi = SVI(model_fn, guide_fn, scheduler, loss=Trace_ELBO())
+    svi = SVI(model_fn, guide, scheduler, loss=Trace_ELBO())
 
     print("\n--- Starting Training ---")
     
@@ -434,7 +440,7 @@ if __name__ == "__main__":
         max_beta = 0.1  # Max KL weight (equivalent to saying "Data is 10x more important than Prior")
         if relative_epoch < ramp_epochs:
             # Linear ramp from ~0.001 to 1.0 (Floor of 0.001 prevents distribution collapse on restart)
-            current_kl_weight = max_beta #max(0.00001, (relative_epoch / ramp_epochs)*max_beta)
+            current_kl_weight = max(0.00001, (relative_epoch / ramp_epochs)*max_beta)
         else:
             current_kl_weight = max_beta
             
@@ -446,17 +452,17 @@ if __name__ == "__main__":
             
             # Step SVI
             loss = svi.step(x_g_batch, x_l_batch, y_batch, total_size=total_size, kl_weight=current_kl_weight)
-            epoch_loss += loss
+            epoch_loss += loss * current_kl_weight
             
         # 5. CRITICAL: Step the scheduler at the epoch level!
         scheduler.step()
         
         with torch.no_grad():
             ll, kl = get_ll_kl(
-                model_fn, guide_fn,
+                model_fn, guide,
                 x_g_batch, x_l_batch, y_batch,  # use last batch as proxy, or full data
                 total_size=total_size,
-                kl_weight=current_kl_weight
+                kl_weight=1.0 
             )
             epoch_ll += ll
             epoch_kl += kl
@@ -470,7 +476,7 @@ if __name__ == "__main__":
     
     # 6. SAVE MODEL & SCALER
     # Save parameters for the BNN weights
-    pyro.get_param_store().save("ghost_bus_model_params_2000.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_LL.pt")
     # Save the Y-Scaler to convert predictions back to seconds
     joblib.dump(scaler_y, "y_scaler.pkl")
     print("\nModel weights and scaler saved successfully.")
@@ -500,7 +506,7 @@ if __name__ == "__main__":
     list_of_predict_sections = [[] for i in range(num_segment)]
     list_of_confidence_sections = [[] for i in range(num_segment)]
     list_of_actual_sections = [[] for i in range(num_segment)]
-    predictive = Predictive(model_fn, guide=guide_fn, num_samples=50)
+    predictive = Predictive(model_fn, guide=guide, num_samples=50)
 
     
     # Counters for accuracy
