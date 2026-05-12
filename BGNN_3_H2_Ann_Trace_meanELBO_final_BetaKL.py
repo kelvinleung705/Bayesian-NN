@@ -93,97 +93,64 @@ class LocalIsolationLayer(PyroModule):
 # 2. UNIQUE MIXING LAYER (With Dropout & Weights)
 # ==========================================
 class NeighborMixingLayer(PyroModule):
-    """
-    LAYER 2: MIXING
-    Each segment has its own network.
-    Input = Output of Previous Layer (Self) + Output of Previous Layer (Neighbors)
-    """
-    def __init__(self, input_dim, output_dim, num_segments, dropout_rate=0.2, device = 'cuda'):
+    def __init__(self, input_dim, output_dim, num_segments, dropout_rate=0.2, device='cuda'):
         super().__init__()
         self.num_segments = num_segments
         self.device = device
         
         loc_self = torch.tensor(2., device=device)
-        loc_side = torch.tensor(0.0, device=device) #0
+        loc_side = torch.tensor(0.0, device=device)
         scale = torch.tensor(1.0, device=device)
-        
         zero = torch.tensor(0., device=device)
         w_scale = torch.tensor(1.0, device=device)
         b_scale = torch.tensor(0.1, device=device)
 
         self.w_self = PyroSample(dist.Normal(loc_self, scale).expand([num_segments]).to_event(1))
-        #self.w_left = PyroSample(dist.Normal(loc_side, scale).expand([num_segments]).to_event(1))
         self.w_right = PyroSample(dist.Normal(loc_side, scale).expand([num_segments]).to_event(1))
         
         self.nets_1 = PyroModuleList([])
         self.nets_2 = PyroModuleList([])
         
-        he_std = (2.0 / (input_dim * 2)) ** 0.5
-        
         for i in range(num_segments):
-            # Input size x3 because we concat [Self, Left, Right]
             net_input_dim = input_dim * 2
             net_1 = PyroModule[nn.Linear](net_input_dim, output_dim)
             net_1.weight = PyroSample(dist.Normal(zero, w_scale).expand([output_dim, net_input_dim]).to_event(2))
-            
             net_1.bias = PyroSample(dist.Normal(zero, b_scale).expand([output_dim]).to_event(1))
             self.nets_1.append(net_1)
     
         self.dropout_1 = PyroModule[nn.Dropout](p=dropout_rate)
         
         for i in range(num_segments):
-            # Input size x3 because we concat [Self, Left, Right]
             net_2 = PyroModule[nn.Linear](output_dim, output_dim)
             net_2.weight = PyroSample(dist.Normal(zero, w_scale).expand([output_dim, output_dim]).to_event(2))
-            
             net_2.bias = PyroSample(dist.Normal(zero, b_scale).expand([output_dim]).to_event(1))
             self.nets_2.append(net_2)
         
         self.dropout_2 = PyroModule[nn.Dropout](p=dropout_rate)
         
     def forward(self, prev_layer_outputs):
-        outputs = []
-        all_sampled_weights_1 = []
-        all_sampled_weights_2 = []
+        outputs =[]
         for i in range(self.num_segments):
-            # Apply individual weights using softmax to ensure positivity
-            #ws = torch.nn.functional.softmax(self.w_self[i], dim=0)
             ws = torch.nn.functional.softplus(self.w_self[i])
-            #wl = torch.nn.functional.softplus(self.w_left[i])
             wr = torch.nn.functional.softplus(self.w_right[i])
             self_feat = prev_layer_outputs[i] * ws
             
-            """
-            if i > 0:
-                left_feat = prev_layer_outputs[i-1] * wl
-            else:
-                left_feat = torch.zeros_like(self_feat)
-            """
             if i < self.num_segments - 1:
                 right_feat = prev_layer_outputs[i+1] * wr
             else:
                 right_feat = torch.zeros_like(self_feat)
 
-            #combined = torch.cat([self_feat, left_feat, right_feat], dim=1)
             combined = torch.cat([self_feat, right_feat], dim=1)
             
             out = self.nets_1[i](combined)
-            
             out = self.dropout_1(out) 
-            all_sampled_weights_1.append(self.nets_1[i].weight.abs().mean())
             out = torch.nn.functional.silu(out)
+            
             out = self.nets_2[i](out)
             out = self.dropout_2(out)
-            all_sampled_weights_2.append(self.nets_2[i].weight.abs().mean()) 
             out = torch.nn.functional.silu(out)
+            
             outputs.append(out)
-        avg_weight_mag_1 = torch.stack(all_sampled_weights_1).mean()
-        avg_weight_mag_2 = torch.stack(all_sampled_weights_2).mean()
-        w_std_1 = self.nets_1[0].weight.std() 
-        w_std_2 = self.nets_2[0].weight.std() 
-    
-        #print(f"Weight Magnitude layer 1(Abs): {avg_weight_mag_1.item():.4f} | Spread (Std): {w_std_1.item():.4f}")
-        #print(f"Weight Magnitude layer 2(Abs): {avg_weight_mag_2.item():.4f} | Spread (Std): {w_std_2.item():.4f}")
         return outputs
 
 
@@ -191,11 +158,12 @@ class NeighborMixingLayer(PyroModule):
 # 3. THE "MATRIX" GNN MODEL
 # ==========================================
 class MatrixGNN(PyroModule):
-    def __init__(self, num_sections=3, global_dim=12, local_dim=4, hidden_dim=8, device = 'cuda'):
+    def __init__(self, num_sections=3, global_dim=12, local_dim=4, hidden_dim=8, device = 'cuda', pnt_1 = None):
         super().__init__()
         self.num_sections = num_sections
         self.device = device
         input_dim = global_dim + local_dim + 1 
+        self.pnt_1 = pnt_1
         
         # --- Layer 0: Input Projection (Unique per segment) ---
         
@@ -260,6 +228,9 @@ class MatrixGNN(PyroModule):
         inputs_list = []
         for i in range(self.num_sections):
             loc_i = all_sections_data[:, i, :]
+            if self.pnt_1 is None:
+                self.pnt_1 = True
+                #print(loc_i.abs().mean().item(), loc_i)
             time_i = accumulated_time[:, i, :]
             inp = torch.cat([global_features, loc_i, time_i], dim=1)
             inputs_list.append(inp)
@@ -280,6 +251,11 @@ class MatrixGNN(PyroModule):
             final_feat = h_current[i] 
             
             loc = self.heads_loc[i](final_feat)
+            if self.pnt_1 is True:
+                self.pnt_1 = False
+            #print(loc)
+            #it will converge
+            #print(loc.mean().item())
             scale = torch.nn.functional.softplus(self.heads_scale[i](final_feat)) + 1e-3 #0.1
             #print(i)
             #print(scale)
@@ -290,6 +266,7 @@ class MatrixGNN(PyroModule):
             all_locs.append(loc)
             all_scales.append(scale)
             all_dfs.append(df)
+            #print(loc.abs().mean().item())
         
         
         # 3. Heads (Early Exit) 
@@ -384,7 +361,7 @@ if __name__ == "__main__":
 
     # Initialize The Matrix Model
     #14
-    bnn_model = MatrixGNN(num_sections=num_segment, global_dim=9, local_dim=4, hidden_dim=32, device=device).to(device)
+    bnn_model = MatrixGNN(num_sections=num_segment, global_dim=9, local_dim=4, hidden_dim=32, device=device, ).to(device)
     
     # Define Guide (Posterior approximation)
     base_guide = AutoDiagonalNormal(model_fn).to(device)
@@ -472,7 +449,7 @@ if __name__ == "__main__":
     
     # 6. SAVE MODEL & SCALER
     # Save parameters for the BNN weights
-    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_LL_Sample.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_4000_df10_KL_9.pt")
     # Save the Y-Scaler to convert predictions back to seconds
     joblib.dump(scaler_y, "y_scaler.pkl")
     print("\nModel weights and scaler saved successfully.")

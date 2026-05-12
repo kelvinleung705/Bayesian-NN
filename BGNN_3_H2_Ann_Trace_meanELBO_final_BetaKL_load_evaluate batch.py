@@ -42,7 +42,8 @@ def process_validation_data(file_path, loaded_scaler):
     # Extract and Normalize Targets (Y) using LOADED scaler
     y_raw = raw_data_np[:, 9:9+num_segment]
     y_scaled_all = torch.tensor(loaded_scaler.transform(y_raw), dtype=torch.float32)
-    
+    return x_global_all, x_local_all, y_scaled_all
+    """
     # --- CRITICAL FIX: Replicate the original Validation Split ---
     idx = np.arange(x_global_all.shape[0])
     train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42)
@@ -52,6 +53,7 @@ def process_validation_data(file_path, loaded_scaler):
     y_val = y_scaled_all[val_idx]
     
     return x_global_val, x_local_val, y_val
+    """
 
 
 # ==========================================
@@ -237,10 +239,13 @@ def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
+    #trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy
     saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_Sample.pt" # Replace with exact saved params file name
+    
     saved_scaler_path = "y_scaler.pkl"              # Replace with exact saved scaler file name
+    #file_path = "bad_visibility.xlsx"
     file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_sorted.xlsx"
+    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy.xlsx"
     
     # ==========================================
     # 1. LOAD SCALER & DATA
@@ -283,6 +288,8 @@ if __name__ == "__main__":
         guide_fn(x_global_val[0:1], x_local_val[0:1], y_true=dummy_y)
 
     print("Model parameters loaded and correctly linked! Starting Inference.")
+
+
 
     # ==========================================
     # 3. FAST BATCHED INFERENCE LOOP

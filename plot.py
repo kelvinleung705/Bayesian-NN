@@ -29,9 +29,9 @@ def process_validation_data(file_path, loaded_scaler):
     df = pd.read_excel(file_path, header=None, skiprows=1)
     
     df = df[
-    (df.iloc[:, 2] == 1) & 
-    (df.iloc[:, 6] == 0) &
-    (df.iloc[:, 7] == 0)
+    (df.iloc[:, 2] == 0) & 
+    #(df.iloc[:, 6] == 0) &
+    (df.iloc[:, 55] >= 0)
     ]
     
 
@@ -252,7 +252,7 @@ if __name__ == "__main__":
     saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_Sample.pt" # Replace with exact saved params file name
     saved_scaler_path = "y_scaler.pkl"              # Replace with exact saved scaler file name
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_sorted.xlsx"
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_sorted.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_traffic.xlsx"
     
     
     
@@ -503,7 +503,7 @@ if __name__ == "__main__":
     
     # 4. Apply LOWESS Smoothing
     # frac=0.1 to 0.2 is usually best for traffic trends
-    smooth_frac = 0.001
+    smooth_frac = 0.15
     print(f"Applying LOWESS smoothing to {len(plot_x)} points...")
     
     # lowess returns [x_sorted, y_smoothed]
@@ -547,7 +547,7 @@ if __name__ == "__main__":
     
     # Save the output file
     #output_filename = 'ghost_bus_final_results_bollinger_weekday_good_weather.png'
-    output_filename = 'a.png'
+    output_filename = 'ghost_bus_final_results_bollinger_good_traffic.png'
     plt.savefig(output_filename, dpi=300, bbox_inches='tight')
     print(f"\nSUCCESS! Plot saved as: {output_filename}")
     
