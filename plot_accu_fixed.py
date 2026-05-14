@@ -1,4 +1,5 @@
 import statistics
+from onnx import save
 import torch
 import torch.nn as nn
 import pyro
@@ -8,9 +9,12 @@ from pyro.infer.autoguide import AutoDiagonalNormal
 from pyro.infer import Predictive
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import joblib
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, DataLoader
+import seaborn as sns
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
 num_segment = 9
 
@@ -24,22 +28,15 @@ def process_validation_data(file_path, loaded_scaler):
     """
     print(f"Reading {file_path}...")
     df = pd.read_excel(file_path, header=None, skiprows=1)
-    """
+    
     df = df[
-    #(df.iloc[:, 2] == 1) & 
-    #(df.iloc[:, 7] <= 2) #&
-    #(df.iloc[:, 56 ] == 5)
-    (df.iloc[:, 56].isin([5]))
+    (df.iloc[:, 2] == 1) & 
+    (df.iloc[:, 7] <= 2) #&
+    #(df.iloc[:, 56].isin([5]))
     ]
-    """
     
     
-    
-    
-    
-    
-    
-    
+
 
     end = 14 + num_segment + 1 + (num_segment * 4)
     df_subset = df.iloc[:, 0:end]
@@ -58,66 +55,43 @@ def process_validation_data(file_path, loaded_scaler):
     # Extract and Normalize Targets (Y) using LOADED scaler
     y_raw = raw_data_np[:, 9:9+num_segment]
     y_scaled_all = torch.tensor(loaded_scaler.transform(y_raw), dtype=torch.float32)
-    print("Total rows loaded:", raw_data_np.shape[0])
-    print("Sample y_raw row 0:", y_raw[0])        # Should be travel times, not global features
-    print("Sample x_local row 0:", raw_local[0])  # Should be local segment features
-    print("y_raw mean per segment:", y_raw.mean(axis=0))
-    print("y_raw std per segment:", y_raw.std(axis=0))
-    return x_global_all, x_local_all, y_scaled_all
-    """
+    
     # --- CRITICAL FIX: Replicate the original Validation Split ---
     idx = np.arange(x_global_all.shape[0])
-    train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42)
+    #train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42)
     
-    x_global_val = x_global_all[val_idx]
-    x_local_val = x_local_all[val_idx]
-    y_val = y_scaled_all[val_idx]
+    x_global_val = x_global_all[idx]
+    x_local_val = x_local_all[idx]
+    y_val = y_scaled_all[idx]
     
-    return x_global_val, x_local_val, y_val
-    """
+    return x_global_val, x_local_val, y_val, idx
 
 
 # ==========================================
 # 2. MODEL ARCHITECTURE (Required for loading)
 # ==========================================
 class LocalIsolationLayer(PyroModule):
-    """
-    LAYER 1: PURELY LOCAL
-    Each segment has its own neural network.
-    NO neighbor information is used here.
-    """
-    def __init__(self, input_dim, output_dim, num_segments, device = 'cuda'):
+    def __init__(self, input_dim, output_dim, num_segments, device='cuda'):
         super().__init__()
         self.num_segments = num_segments
         self.nets = PyroModuleList([])
         
         for i in range(num_segments):
-            # Simple Linear transformation for this specific segment
             net = PyroModule[nn.Linear](input_dim, output_dim)
             zero = torch.tensor(0., device=device)
-            point_one = torch.tensor(1, device=device)
+            point_one = torch.tensor(1., device=device)
             df = torch.tensor(15., device=device)
             net.weight = PyroSample(dist.StudentT(df, zero, point_one).expand([output_dim, input_dim]).to_event(2))
             net.bias = PyroSample(dist.StudentT(df, zero, point_one).expand([output_dim]).to_event(1))
             self.nets.append(net)
             
     def forward(self, x_inputs):
-        # x_inputs is a list of tensors, one per segment
-        outputs = []
-        all_sampled_weights = []
+        outputs =[]
         for i in range(self.num_segments):
             out = torch.nn.functional.silu(self.nets[i](x_inputs[i]))
             outputs.append(out)
-            all_sampled_weights.append(self.nets[i].weight.abs().mean())
-        avg_weight = torch.stack(all_sampled_weights).mean()
-        w_std = self.nets[0].weight.std()
-        #print(f"Global Sampled Weight Mean: {avg_weight.item():.4f} | Spread (Std): {w_std.item():.4f}")
         return outputs
-    
-    
-# ==========================================
-# 2. UNIQUE MIXING LAYER (With Dropout & Weights)
-# ==========================================
+
 class NeighborMixingLayer(PyroModule):
     def __init__(self, input_dim, output_dim, num_segments, dropout_rate=0.2, device='cuda'):
         super().__init__()
@@ -179,20 +153,14 @@ class NeighborMixingLayer(PyroModule):
             outputs.append(out)
         return outputs
 
-
-# ==========================================
-# 3. THE "MATRIX" GNN MODEL
-# ==========================================
 class MatrixGNN(PyroModule):
     def __init__(self, num_sections=3, global_dim=12, local_dim=4, hidden_dim=8, device = 'cuda', pnt_1 = None):
         super().__init__()
         self.num_sections = num_sections
         self.device = device
         input_dim = global_dim + local_dim + 1 
-        self.pnt_1 = pnt_1
         
         # --- Layer 0: Input Projection (Unique per segment) ---
-        
             
         self.embedding_layer = LocalIsolationLayer(input_dim, hidden_dim, num_sections, device)
         
@@ -203,7 +171,7 @@ class MatrixGNN(PyroModule):
             NeighborMixingLayer(hidden_dim, hidden_dim, num_sections, dropout_rate=0.2, device=device)
             for _ in range(2) # Layer depth = num_segments
         ])
-                
+        
         # --- Output Heads ---
         final_dim = hidden_dim
         
@@ -222,8 +190,9 @@ class MatrixGNN(PyroModule):
             scale_std = torch.tensor(0.3, device=device)
             scale_bias_mu = torch.tensor(0., device=device)
             scale_bias_std = torch.tensor(3.0, device=device)
-
-            df_std = torch.tensor(1, device=device)
+            
+            three = torch.tensor(3., device=device)
+            df_std = torch.tensor(1., device=device)
             df_bias_mu = torch.tensor(0., device=device)
             df_bias_std = torch.tensor(3.0, device=device)
             
@@ -250,7 +219,8 @@ class MatrixGNN(PyroModule):
         device = global_features.device
         
         # Initialize a single running clock (not a vector of zeros for all sections)
-        current_time = torch.zeros(batch_size, 1).to(self.device)
+        #current_time = torch.zeros(batch_size, 1).to(device)
+        current_time = torch.zeros(batch_size, 1).to(device)
         
         all_locs = []
         all_scales = []
@@ -264,32 +234,15 @@ class MatrixGNN(PyroModule):
                 loc_i = all_sections_data[:, i, :]
                 # THE CRITICAL INJECTION LOGIC
                 if i == current_section:
-                    # If we are looking at the section we are currently predicting,
-                    # we inject the REAL running clock time.
                     time_i = current_time
-                    #time_i = current_time[:, i:i+1] 
-                    #time_i = torch.zeros(batch_size, 1).to(device)
                 elif i < current_section:
-                    # For sections in the PAST, we could inject their actual historical times,
-                    # but for simplicity, feeding the current clock is often enough, 
-                    # or you can feed 0 if you want them to be "static anchors".
-                    # Let's feed the current clock to show "how far past" they are.
                     time_i = current_time
-                    #time_i = current_time[:, i:i+1] 
-                    #time_i = torch.zeros(batch_size, 1).to(device)
-                    
                 else:
-                    # For sections in the FUTURE, we don't know the time yet.
-                    # We feed 0.0 (or you could feed current_time as a baseline).
-                    # Let's feed 0.0 to indicate "unreached".
-                    #time_i = torch.zeros(batch_size, 1).to(device)
-                    time_i = current_time
-                    #time_i = current_time[:, i:i+1] 
-                if time_i.abs().sum() > 0:
-                    time_i_stable = self.time_norm(time_i)
-                else:
-                    time_i_stable = time_i
-                inp = torch.cat([global_features, loc_i, time_i_stable], dim=1)
+                    time_i = torch.zeros(batch_size, 1).to(device)
+                
+                if time_i.abs().mean().item() > 15:
+                    time_i = torch.zeros(batch_size, 1).to(device)
+                inp = torch.cat([global_features, loc_i, time_i], dim=1)
                 inputs_list.append(inp)
                 
             # 2. Run the full GNN (Embedding + Mixing) to get context
@@ -302,10 +255,6 @@ class MatrixGNN(PyroModule):
             final_feat = h_current[current_section] 
             
             loc = self.heads_loc[current_section](final_feat)
-            if self.pnt_1 is True:
-                self.pnt_1 = False
-                #print(loc)
-            #print("loc:", loc.mean().item())
             scale = torch.nn.functional.softplus(self.heads_scale[current_section](final_feat)) + 1e-3 
             df = torch.nn.functional.softplus(self.heads_df[current_section](final_feat)) + 2.5
             
@@ -313,16 +262,11 @@ class MatrixGNN(PyroModule):
             all_locs.append(loc)
             all_scales.append(scale)
             all_dfs.append(df)
-            #print(all_locs[-1].mean().item())
-            #print(all_locs[-1].mean().item())
             # 5. UPDATE THE CLOCK for the next loop iteration
             # We add the predicted travel time of THIS section to the running total.
             
             current_time = current_time + loc
-            
-            #print(loc.abs().mean().item())
-            
-            #current_time = current_time + loc
+                
             
         return all_locs, all_scales, all_dfs
 
@@ -344,20 +288,16 @@ def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    #trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy
-    saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu_flat.pt" # Replace with exact saved params file name
-    #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu_Jan_to_Apr.pt" # Replace with exact saved params file name
-    #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu.pt" # Replace with exact saved params file name
+    
+    saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed.pt" # Replace with exact saved params file name
     
     #saved_scaler_path = "y_scaler_1.pkl"              # Replace with exact saved scaler file name
-    #saved_scaler_path = "y_scaler_Jan_to_Apr.pkl" 
-    saved_scaler_path = "y_scaler_flat.pkl"   
+    saved_scaler_path = "y_scaler_4_fixed.pkl"              # Replace with exact saved scaler file name
+    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_month_sorted.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
     #file_path = "bad_visibility.xlsx"
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_month_sorted.xlsx"
-    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
-    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
-    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy2_flagged.xlsx"
-    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy.xlsx"
+    
+    
     
     # ==========================================
     # 1. LOAD SCALER & DATA
@@ -365,12 +305,33 @@ if __name__ == "__main__":
     print("\n--- Loading Scaler & Processing Data ---")
     loaded_scaler = joblib.load(saved_scaler_path)
     
-    x_global_val, x_local_val, y_val = process_validation_data(file_path, loaded_scaler)
+    x_global_val, x_local_val, y_val, val_idx = process_validation_data(file_path, loaded_scaler)
     
     x_global_val = x_global_val.to(device)
     x_local_val = x_local_val.to(device)
     y_val = y_val.to(device)
+    
+    
+    # --- 核心修復：從 Sin/Cos 還原為 0-24 小時 ---
+    print("從嵌入向量 (Sin/Cos) 逆向還原時間軸...")
+    
+    # 提取第 0 列 (Sin) 和 第 1 列 (Cos)
+    val_time_sin = x_global_val[:, 0].cpu().numpy()
+    val_time_cos = x_global_val[:, 1].cpu().numpy()
+    
+    # 使用 arctan2 算出弧度 (範圍是 -pi 到 pi)
+    # np.arctan2(y, x) 對應的是 np.arctan2(sin, cos)
+    angles_radians = np.arctan2(val_time_sin, val_time_cos)
+    
+    # 將弧度轉換回分鐘 (1天 = 1440分鐘)
+    # 如果角度是負的，加上 2*pi 轉回正數
+    total_minutes = (angles_radians / (2 * np.pi)) * 1440.0
+    total_minutes = np.where(total_minutes < 0, total_minutes + 1440.0, total_minutes)
+    
+    # 轉換為 24 小時制的小數 (例如 8.5 代表 08:30 AM)
+    time_decimal = total_minutes / 60.0
 
+    print(f"DEBUG: 成功還原時間軸！前 5 個行程時間: {time_decimal[:5].round(2)}")
     # ==========================================
     # 2. RECONSTRUCT & LOAD MODEL
     # ==========================================
@@ -400,32 +361,6 @@ if __name__ == "__main__":
         guide_fn(x_global_val[0:1], x_local_val[0:1], y_true=dummy_y)
 
     print("Model parameters loaded and correctly linked! Starting Inference.")
-    
-    # ==========================================
-# NETRON EXPORT — Add after Section 2 (Model Load)
-# ==========================================
-import torch.onnx
-
-class NetronExportWrapper(nn.Module):
-    """
-    Wraps MatrixGNN with a frozen guide trace so all PyroSample
-    weights become deterministic tensor ops that can be traced/exported.
-    """
-    def __init__(self, bnn_model, frozen_trace):
-        super().__init__()
-        self.bnn_model = bnn_model
-        self.frozen_trace = frozen_trace
-
-    def forward(self, x_global: torch.Tensor, x_local: torch.Tensor):
-        # Replay frozen weights through the model — no live sampling
-        with pyro.poutine.replay(trace=self.frozen_trace):
-            locs, scales, dfs = self.bnn_model(x_global, x_local)
-        
-        # Concatenate per-segment outputs into single tensors
-        loc_out   = torch.cat(locs,   dim=1)   # (batch, num_segment)
-        scale_out = torch.cat(scales, dim=1)
-        df_out    = torch.cat(dfs,    dim=1)
-        return loc_out, scale_out, df_out
 
     # ==========================================
     # 3. FAST BATCHED INFERENCE LOOP
@@ -528,8 +463,7 @@ class NetronExportWrapper(nn.Module):
     # but I have left the full loop here in case you need it.
     
     print_limit = len(x_global_val) # Change this to 5 if you just want a quick peek
-    all_loc = 0
-    all_std = 0
+    
     for j in range(print_limit):
         print(f"\n--- Sample {j} ---")
         for i in range(num_segment):
@@ -539,8 +473,7 @@ class NetronExportWrapper(nn.Module):
         print(f"\nTotal ETA: {total_pred[j]:.2f} seconds (Actual: {total_act[j]:.2f})")
         print(f"Within Bound? : {'YES' if within_bound_mask[j] else 'NO'}")
         print(f"Confidence: +/- {total_std[j]:.2f} seconds")
-        all_loc += total_pred[j]
-        all_std += total_std[j]
+        
         conf_level = total_pred[j] / total_std[j] if total_std[j] > 0 else 0
         print(f"Confidence Level: {conf_level:.2f}")
         
@@ -559,6 +492,109 @@ class NetronExportWrapper(nn.Module):
     print(f"總共 {total_samples} 筆驗證資料中，有 {within_bound_count} 筆落在預測區間內。")
     print(f"平均 {num_segment} Section，有 {section_within_bound_counts / total_samples:.2f} section 落在預測區間內。")
     print(f"平均置信度指標: {number_of_ratio_sum / total_samples:.2f}")
-    print(f"平均預測時間: {all_loc / print_limit:.2f}")
-    print(f"平均置信度: {all_std / print_limit:.2f}")
     print("==============================================")
+    
+    print("\n" + "="*30)
+    print("FINAL VALIDATION SUMMARY")
+    print("="*30)
+    print(f"Total Validated Trips: {len(x_global_val)}")
+    print(f"Total Coverage (Trip within 1 StdDev): {(within_bound_count/len(x_global_val))*100:.2f}%")
+    print(f"Mean Absolute Error: {np.mean(np.abs(total_act - total_pred)):.2f} seconds")
+    print("="*30)
+    
+    # ==========================================
+    # 7. CLEANING, SMOOTHING AND PLOTTING
+    # ==========================================
+    print("\nPreparing data for visualization...")
+    
+    # 1. Ensure everything is a 1D NumPy array and remove any invalid numbers
+    plot_x = np.array(time_decimal).flatten()
+    plot_y = np.array(total_pred).flatten()
+    plot_act = np.array(total_act).flatten()
+    plot_std = np.array(total_std).flatten()
+    
+    # --- DIAGNOSTIC PRINTS ---
+    print(f"\nDEBUG: Initial array lengths -> X: {len(plot_x)}, Y_pred: {len(plot_y)}, Y_act: {len(plot_act)}, Std: {len(plot_std)}")
+    for i in range(len(plot_x)):
+        if plot_x[i] < 3:
+            plot_x[i] += 24
+    if len(plot_x) > 0:
+        print(f"DEBUG: First 5 X (Time) values: {plot_x[:5]}")
+    if len(plot_y) > 0:
+        print(f"DEBUG: First 5 Y_pred values: {plot_y[:5]}")
+        print(f"DEBUG: First 5 Y_act values: {plot_act[:5]}")
+    # -------------------------
+
+    # 2. Filter out any NaNs or Infinities that would break the smoother
+    valid_mask = np.isfinite(plot_x) & np.isfinite(plot_y) & np.isfinite(plot_act) & np.isfinite(plot_std)
+    plot_x = plot_x[valid_mask]
+    #print(plot_x[:10])
+    plot_y = plot_y[valid_mask]
+    #print(plot_y[:10])
+    plot_act = plot_act[valid_mask]
+    #print(plot_act[:10])
+    plot_std = plot_std[valid_mask]
+    #print(plot_std[:10])
+
+    # 3. Calculate 95% Confidence Bounds
+    #1.96
+    upper_95 = plot_y + (1 * plot_std)
+    print(upper_95[:10])
+    lower_95 = plot_y - (1 * plot_std)
+    print(lower_95[:10])
+
+    
+    # 4. Apply LOWESS Smoothing
+    # frac=0.1 to 0.2 is usually best for traffic trends
+    smooth_frac = 0.15
+    print(f"Applying LOWESS smoothing to {len(plot_x)} points...")
+    
+    # lowess returns [x_sorted, y_smoothed]
+    m_smooth = lowess(plot_y, plot_x, frac=smooth_frac)
+    u_smooth = lowess(upper_95, plot_x, frac=smooth_frac)
+    l_smooth = lowess(lower_95, plot_x, frac=smooth_frac)
+    
+
+    # 5. GENERATE THE FINAL PLOT
+    sns.set_theme(style="whitegrid", context="paper")
+    plt.figure(figsize=(16, 9))
+
+    # A. Raw Actual Times (The Gray Cloud)
+    plt.scatter(plot_x, plot_act, color='black', alpha=0.2, s=12, label='Actual Trip Times', zorder=1)
+
+    # B. The Bollinger Band (95% CI)
+    # We use the X values from the smoother (which are already sorted)
+    plt.fill_between(m_smooth[:, 0], l_smooth[:, 1], u_smooth[:, 1], 
+                     color='#3498db', alpha=0.3, label='BNN 95% Predictive Uncertainty', zorder=2)
+
+    # C. The Mean ETA Line (Trend Forecast)
+    plt.plot(m_smooth[:, 0], m_smooth[:, 1], color='#2c3e50', linewidth=3, label='Mean ETA Forecast', zorder=3)
+
+    # --- FORMATTING ---
+    plt.title('Bayesian Transit ETA: Predictive Uncertainty vs. Time of Day', fontsize=18, fontweight='bold', pad=20)
+    plt.xlabel('Time of Day (24h Format)', fontsize=14)
+    plt.ylabel('Total Travel Time (Seconds)', fontsize=14)
+    
+    # Grid and Ticks
+    plt.xlim(5, 25)
+    plt.ylim(300, 900) # Y 軸：從 300 秒到 900 秒
+    plt.xticks(np.arange(5, 26, 1))
+    plt.yticks(np.arange(300, 901, 100))
+    
+    # Smart Y-axis scaling: Show data up to the 99th percentile to avoid 1 crazy outlier squashing the graph
+    #plt.ylim(0, np.percentile(plot_act, 99.5) * 1.1) 
+
+    plt.legend(loc='upper left', fontsize=12, frameon=True, shadow=True)
+    sns.despine()
+    plt.tight_layout()
+    
+    # Save the output file
+    #output_filename = 'ghost_bus_accu_results_bollinger_weekend.png'
+    output_filename = 'ghost_bus_accu2_results_bollinger_weekday_good_weather_2026.png'
+    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+    print(f"\nSUCCESS! Plot saved as: {output_filename}")
+    
+    try:
+        plt.show()
+    except Exception:
+        print("Interactive window not available. Please open the PNG file to see the result.")

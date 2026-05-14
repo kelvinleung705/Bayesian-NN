@@ -253,6 +253,7 @@ class MatrixGNN(PyroModule):
                     time_i = current_time
                 else:
                     time_i = torch.zeros(batch_size, 1).to(device)
+                    #time_i = current_time
                 
                 if time_i.abs().mean().item() > 15:
                     time_i = torch.zeros(batch_size, 1).to(device)
@@ -490,35 +491,43 @@ class NetronExportWrapper(nn.Module):
     print_limit = len(x_global_val) # Change this to 5 if you just want a quick peek
     all_loc = 0
     all_std = 0
+    """
     overload = 0
+    list_of_extreme = []
     for j in range(print_limit):
-        if total_pred[j] > 2000 or total_std[j] > 500:
+        #if total_pred[j] > 2000 or total_std[j] > 500:
+        if total_pred[j] < total_std[j]:
             overload += 1
-        
-        print(f"\n--- Sample {j} ---")
-        for i in range(num_segment):
-            is_in_bound = "YES" if sec_within_bounds_mask[j, i] else "NO"
-            print(f"  Sec {i}: Pred {pred_real[j, i]:.1f}s | Actual {actual_real[j, i]:.1f}s | Conf +/- {std_real[j, i]:.1f}s | Within Bound? {is_in_bound}")
-        if total_pred[j] > max_pred:
-            max_pred = total_pred[j]
-        if total_std[j] > max_conf:
-            max_conf = total_std[j]
-        print(f"\nTotal ETA: {total_pred[j]:.2f} seconds (Actual: {total_act[j]:.2f})")
-        print(f"Within Bound? : {'YES' if within_bound_mask[j] else 'NO'}")
-        print(f"Confidence: +/- {total_std[j]:.2f} seconds")
-        all_loc += total_pred[j]
-        all_std += total_std[j]
-        conf_level = total_pred[j] / total_std[j] if total_std[j] > 0 else 0
-        print(f"Confidence Level: {conf_level:.2f}")
+            list_of_extreme.append(j)
+            print(f"\n--- Sample {j} ---")
+            for i in range(num_segment):
+                is_in_bound = "YES" if sec_within_bounds_mask[j, i] else "NO"
+                print(f"  Sec {i}: Pred {pred_real[j, i]:.1f}s | Actual {actual_real[j, i]:.1f}s | Conf +/- {std_real[j, i]:.1f}s | Within Bound? {is_in_bound}")
+            if total_pred[j] > max_pred:
+                max_pred = total_pred[j]
+            if total_std[j] > max_conf:
+                max_conf = total_std[j]
+            print(f"\nTotal ETA: {total_pred[j]:.2f} seconds (Actual: {total_act[j]:.2f})")
+            print(f"Within Bound? : {'YES' if within_bound_mask[j] else 'NO'}")
+            print(f"Confidence: +/- {total_std[j]:.2f} seconds")
+            all_loc += total_pred[j]
+            all_std += total_std[j]
+            conf_level = total_pred[j] / total_std[j] if total_std[j] > 0 else 0
+            print(f"Confidence Level: {conf_level:.2f}")
     
-        # Current running error metrics
-        current_error_tendency = np.sum(error_rates[:j+1]) / (j + 1)
-        current_error_squared = np.sum(abs_errors[:j+1]) / (j + 1)
+            # Current running error metrics
+            current_error_tendency = np.sum(error_rates[:j+1]) / (j + 1)
+            current_error_squared = np.sum(abs_errors[:j+1]) / (j + 1)
         
-        print(f"\nPrediction Std Deviation: {pred_running_std[j]:.2f} , Confidence Std Deviation: {conf_running_std[j]:.2f} , Actual Std Deviation: {act_running_std[j]:.2f}")
-        print(f"Error (MAE running): {current_error_squared:.2f}")
-        print(f"Error Tendency (Bias running): {current_error_tendency:.2f}")
+            print(f"\nPrediction Std Deviation: {pred_running_std[j]:.2f} , Confidence Std Deviation: {conf_running_std[j]:.2f} , Actual Std Deviation: {act_running_std[j]:.2f}")
+            print(f"Error (MAE running): {current_error_squared:.2f}")
+            print(f"Error Tendency (Bias running): {current_error_tendency:.2f}")
 
+    print_limit = print_limit - len(list_of_extreme)
+    for i in sorted(list_of_extreme, reverse=True):
+        del all_loc[i]
+    for i in sorted(list_of_extreme, reverse=True):
+        del all_std[i]
     # ==========================================
     # 6. FINAL METRICS SUMMARY
     # ==========================================
@@ -532,3 +541,69 @@ class NetronExportWrapper(nn.Module):
     print(max_pred)
     print(max_conf)
     print(overload)
+    """
+    overload = 0
+    list_of_extreme = []
+    max_pred = 0
+    max_conf = 0
+    
+    # 1. Create variables to sum only the VALID (non-extreme) samples
+    valid_loc_sum = 0.0
+    valid_std_sum = 0.0
+    valid_count = 0
+
+    for j in range(print_limit):
+        # EXTREME CONDITION
+        if total_pred[j] < total_std[j]:
+            overload += 1
+            list_of_extreme.append(j)
+            print(f"\n--- Sample {j} ---")
+            for i in range(num_segment):
+                is_in_bound = "YES" if sec_within_bounds_mask[j, i] else "NO"
+                print(f"  Sec {i}: Pred {pred_real[j, i]:.1f}s | Actual {actual_real[j, i]:.1f}s | Conf +/- {std_real[j, i]:.1f}s | Within Bound? {is_in_bound}")
+            
+            if total_pred[j] > max_pred:
+                max_pred = total_pred[j]
+            if total_std[j] > max_conf:
+                max_conf = total_std[j]
+                
+            print(f"\nTotal ETA: {total_pred[j]:.2f} seconds (Actual: {total_act[j]:.2f})")
+            print(f"Within Bound? : {'YES' if within_bound_mask[j] else 'NO'}")
+            print(f"Confidence: +/- {total_std[j]:.2f} seconds")
+            
+            conf_level = total_pred[j] / total_std[j] if total_std[j] > 0 else 0
+            print(f"Confidence Level: {conf_level:.2f}")
+    
+            # Current running error metrics
+            current_error_tendency = np.sum(error_rates[:j+1]) / (j + 1)
+            current_error_squared = np.sum(abs_errors[:j+1]) / (j + 1)
+        
+            print(f"\nPrediction Std Deviation: {pred_running_std[j]:.2f} , Confidence Std Deviation: {conf_running_std[j]:.2f} , Actual Std Deviation: {act_running_std[j]:.2f}")
+            print(f"Error (MAE running): {current_error_squared:.2f}")
+            print(f"Error Tendency (Bias running): {current_error_tendency:.2f}")
+
+        # NORMAL / VALID CONDITION (Skips the extremes automatically)
+        else:
+            valid_loc_sum += total_pred[j]
+            valid_std_sum += total_std[j]
+            valid_count += 1
+
+    # 2. Safely calculate averages avoiding division by zero
+    avg_loc = valid_loc_sum / valid_count if valid_count > 0 else 0
+    avg_std = valid_std_sum / valid_count if valid_count > 0 else 0
+
+    # ==========================================
+    # 6. FINAL METRICS SUMMARY
+    # ==========================================
+    print("\n==============================================")
+    print(f"總共 {total_samples} 筆驗證資料中，有 {within_bound_count} 筆落在預測區間內。")
+    print(f"平均 {num_segment} Section，有 {section_within_bound_counts / total_samples:.2f} section 落在預測區間內。")
+    print(f"平均置信度指標: {number_of_ratio_sum / total_samples:.2f}")
+    
+    # 3. Print the new, clean averages
+    print(f"過濾 {overload} 筆極端值後的 平均預測時間: {avg_loc:.2f}")
+    print(f"過濾 {overload} 筆極端值後的 平均置信度: {avg_std:.2f}")
+    print("==============================================")
+    print(f"Max Extreme Pred: {max_pred:.2f}")
+    print(f"Max Extreme Conf: {max_conf:.2f}")
+    print(f"Total Overloads skipped: {overload}")

@@ -130,7 +130,7 @@ class DeterministicNeighborMixingLayer(nn.Module):
 # 3. DETERMINISTIC "MATRIX" GNN MODEL
 # ==========================================
 class DeterministicMatrixGNN(nn.Module):
-    def __init__(self, num_sections=9, global_dim=9, local_dim=4, hidden_dim=32):
+    def __init__(self, num_sections=9, global_dim=9, local_dim=4, hidden_dim=16):
         super().__init__()
         self.num_sections = num_sections
         input_dim = global_dim + local_dim + 1 
@@ -139,7 +139,7 @@ class DeterministicMatrixGNN(nn.Module):
         
         self.prop_layers = nn.ModuleList([
             DeterministicNeighborMixingLayer(hidden_dim, hidden_dim, num_sections, dropout_rate=0.2)
-            for _ in range(3)
+            for _ in range(2)
         ])
         
         # --- Output Heads ---
@@ -154,7 +154,7 @@ class DeterministicMatrixGNN(nn.Module):
         device = global_features.device
         
         # Virtual Clock
-        current_time = torch.zeros(batch_size, self.num_sections).to(device)
+        current_time = torch.zeros(batch_size, 1).to(device)
         
         all_locs = []
         
@@ -170,7 +170,7 @@ class DeterministicMatrixGNN(nn.Module):
                     # If we are looking at the section we are currently predicting,
                     # we inject the REAL running clock time.
                     #time_i = current_time
-                    time_i = current_time[:, i:i+1] 
+                    time_i = current_time
                     #time_i = torch.zeros(batch_size, 1).to(device)
                 elif i < current_section:
                     # For sections in the PAST, we could inject their actual historical times,
@@ -178,7 +178,7 @@ class DeterministicMatrixGNN(nn.Module):
                     # or you can feed 0 if you want them to be "static anchors".
                     # Let's feed the current clock to show "how far past" they are.
                     #time_i = current_time
-                    time_i = current_time[:, i:i+1] 
+                    time_i = current_time
                     #time_i = torch.zeros(batch_size, 1).to(device)
                     
                 else:
@@ -186,7 +186,7 @@ class DeterministicMatrixGNN(nn.Module):
                     # We feed 0.0 (or you could feed current_time as a baseline).
                     # Let's feed 0.0 to indicate "unreached".
                     #time_i = torch.zeros(batch_size, 1).to(device)
-                    time_i = current_time[:, i:i+1] 
+                    time_i = torch.zeros(batch_size, 1).to(device)
                 
                 if time_i.abs().mean().item() > 15:
                     time_i = torch.zeros(batch_size, 1).to(device)
@@ -215,15 +215,13 @@ class DeterministicMatrixGNN(nn.Module):
             # 5. UPDATE THE CLOCK for the next loop iteration
             # We add the predicted travel time of THIS section to the running total.
             
-            for j in range(current_section, self.num_sections):
-                current_time[:, j:j+1] = current_time[:, j:j+1] + loc
+            current_time = current_time + loc
             
             #print(loc.abs().mean().item())
             
             #current_time = current_time + loc
             
         return all_locs
-
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -236,6 +234,7 @@ if __name__ == "__main__":
     saved_scaler_path = "deterministic_scaler.pkl"  
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_month_sorted.xlsx"  # Ensure this is the correct path to your validation data            
     file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
+    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
     
     # ==========================================
     # 1. LOAD SCALER & DATA
@@ -314,7 +313,7 @@ if __name__ == "__main__":
     total_samples = len(total_act)
 
     # --- HARDCODED MARGIN FOR COVERAGE CALCULATION ---
-    hardcoded_margin = 96.42  # Seconds
+    hardcoded_margin = 99  # Seconds
     
     lower_bound = total_pred - hardcoded_margin
     upper_bound = total_pred + hardcoded_margin

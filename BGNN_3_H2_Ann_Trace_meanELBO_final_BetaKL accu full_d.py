@@ -62,65 +62,64 @@ class LocalIsolationLayer(PyroModule):
     def __init__(self, input_dim, output_dim, num_segments, device='cuda'):
         super().__init__()
         self.num_segments = num_segments
-        self.nets = PyroModuleList([])
-        
-        for i in range(num_segments):
-            net = PyroModule[nn.Linear](input_dim, output_dim)
-            zero = torch.tensor(0., device=device)
-            point_one = torch.tensor(1., device=device)
-            df = torch.tensor(10., device=device)
-            net.weight = PyroSample(dist.StudentT(df, zero, point_one).expand([output_dim, input_dim]).to_event(2))
-            net.bias = PyroSample(dist.StudentT(df, zero, point_one).expand([output_dim]).to_event(1))
-            self.nets.append(net)
+        # Standard PyTorch nn.ModuleList
+        self.nets = nn.ModuleList([
+            nn.Linear(input_dim, output_dim) for _ in range(num_segments)
+        ])
             
     def forward(self, x_inputs):
-        outputs =[]
+        outputs = []
         for i in range(self.num_segments):
             out = torch.nn.functional.silu(self.nets[i](x_inputs[i]))
             outputs.append(out)
         return outputs
 
-class NeighborMixingLayer(PyroModule):
+
+class NeighborMixingLayer(nn.Module): # Note: Inheriting from nn.Module, not PyroModule
+    """
+    LAYER 2: MIXING (DETERMINISTIC)
+    Each segment has its own network.
+    Input = Output of Previous Layer (Self) + Output of Previous Layer (Neighbors)
+    """
     def __init__(self, input_dim, output_dim, num_segments, dropout_rate=0.2, device='cuda'):
         super().__init__()
         self.num_segments = num_segments
         self.device = device
         
-        loc_self = torch.tensor(2., device=device)
-        loc_side = torch.tensor(0.0, device=device)
-        scale = torch.tensor(1.0, device=device)
-        zero = torch.tensor(0., device=device)
-        w_scale = torch.tensor(1.0, device=device)
-        b_scale = torch.tensor(0.1, device=device)
-
-        self.w_self = PyroSample(dist.Normal(loc_self, scale).expand([num_segments]).to_event(1))
-        self.w_right = PyroSample(dist.Normal(loc_side, scale).expand([num_segments]).to_event(1))
+        # --- DETERMINISTIC SPATIAL WEIGHTS ---
+        # Instead of Bayesian priors, these are standard learnable parameters.
+        # We initialize them similarly (Self=2.0, Right=0.0) so the network
+        # starts by prioritizing local information.
+        self.w_self = nn.Parameter(torch.full((num_segments,), 2.0, device=device))
+        self.w_right = nn.Parameter(torch.zeros(num_segments, device=device))
         
-        self.nets_1 = PyroModuleList([])
-        self.nets_2 = PyroModuleList([])
+        # --- DETERMINISTIC NEURAL NETWORKS ---
+        # We use standard nn.ModuleList and nn.Linear
+        self.nets_1 = nn.ModuleList([])
+        self.nets_2 = nn.ModuleList([])
         
         for i in range(num_segments):
             net_input_dim = input_dim * 2
-            net_1 = PyroModule[nn.Linear](net_input_dim, output_dim)
-            net_1.weight = PyroSample(dist.Normal(zero, w_scale).expand([output_dim, net_input_dim]).to_event(2))
-            net_1.bias = PyroSample(dist.Normal(zero, b_scale).expand([output_dim]).to_event(1))
+            
+            # Standard Linear layers automatically initialize their weights deterministically
+            net_1 = nn.Linear(net_input_dim, output_dim, device=device)
             self.nets_1.append(net_1)
     
-        self.dropout_1 = PyroModule[nn.Dropout](p=dropout_rate)
+        self.dropout_1 = nn.Dropout(p=dropout_rate)
         
         for i in range(num_segments):
-            net_2 = PyroModule[nn.Linear](output_dim, output_dim)
-            net_2.weight = PyroSample(dist.Normal(zero, w_scale).expand([output_dim, output_dim]).to_event(2))
-            net_2.bias = PyroSample(dist.Normal(zero, b_scale).expand([output_dim]).to_event(1))
+            net_2 = nn.Linear(output_dim, output_dim, device=device)
             self.nets_2.append(net_2)
         
-        self.dropout_2 = PyroModule[nn.Dropout](p=dropout_rate)
+        self.dropout_2 = nn.Dropout(p=dropout_rate)
         
     def forward(self, prev_layer_outputs):
-        outputs =[]
+        outputs = []
         for i in range(self.num_segments):
+            # Apply softplus to ensure weights remain positive during training
             ws = torch.nn.functional.softplus(self.w_self[i])
             wr = torch.nn.functional.softplus(self.w_right[i])
+            
             self_feat = prev_layer_outputs[i] * ws
             
             if i < self.num_segments - 1:
@@ -139,6 +138,7 @@ class NeighborMixingLayer(PyroModule):
             out = torch.nn.functional.silu(out)
             
             outputs.append(out)
+            
         return outputs
 
 # ==========================================
@@ -176,7 +176,8 @@ class MatrixGNN(PyroModule):
             zero = torch.tensor(0., device=device)
             loc_std = torch.tensor(1.0, device=device)
             loc_bias_mu = torch.tensor(0., device=device)
-            loc_bias_std = torch.tensor(1., device=device)
+            #loc_bias_std = torch.tensor(1., device=device)
+            loc_bias_std = torch.tensor(3., device=device)
 
             scale_std = torch.tensor(0.3, device=device)
             scale_bias_mu = torch.tensor(0., device=device)
@@ -349,17 +350,17 @@ if __name__ == "__main__":
 
     # Initialize The Matrix Model
     #14
-    bnn_model = MatrixGNN(num_sections=num_segment, global_dim=9, local_dim=4, hidden_dim=32, device=device).to(device)
+    bnn_model = MatrixGNN(num_sections=num_segment, global_dim=9, local_dim=4, hidden_dim=16, device=device).to(device)
     
     # Define Guide (Posterior approximation)
     base_guide = AutoDiagonalNormal(model_fn).to(device)
     
-    def guide_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
+    def guide_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1):
         with pyro.poutine.scale(scale=kl_weight):
             return base_guide(x_global, x_local, y_true, total_size=total_size, kl_weight=kl_weight)
     
     # 3. PYRO OPTIMIZER & SCHEDULER (Fixed)
-    CYCLE_LENGTH = 5000  # Sync LR and KL cycles
+    CYCLE_LENGTH = 1250  # Sync LR and KL cycles
     
     # Wrap PyTorch optimizer and scheduler the Pyro way
     optimizer_args = {
@@ -383,7 +384,7 @@ if __name__ == "__main__":
 
     print("\n--- Starting Training ---")
     
-    epochs = 20000
+    epochs = 5000
     batch_size = 1024
     train_dataset = TensorDataset(x_global_train, x_local_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -398,8 +399,8 @@ if __name__ == "__main__":
         # 4. PERFECTLY SYNCHRONIZED KL ANNEALING
         # This replaces the external Annealer to ensure exact syncing with the LR Restart
         relative_epoch = epoch % CYCLE_LENGTH
-        ramp_epochs = 2500  # Spend 1500 epochs ramping up, 1000 epochs holding at 1.0
-        max_beta = 1.0  # Max KL weight (equivalent to saying "Data is 10x more important than Prior")
+        ramp_epochs = 625  # Spend 1500 epochs ramping up, 1000 epochs holding at 1.0
+        max_beta = 1  # Max KL weight (equivalent to saying "Data is 10x more important than Prior")
         if relative_epoch < ramp_epochs:
             # Linear ramp from ~0.001 to 1.0 (Floor of 0.001 prevents distribution collapse on restart)
             current_kl_weight = max(0.00001, (relative_epoch / ramp_epochs)*max_beta)
@@ -434,14 +435,14 @@ if __name__ == "__main__":
             # Safely extract current LR from Pyro's internal dictionary
             current_lr = list(scheduler.optim_objs.values())[0].optimizer.param_groups[0]["lr"] if scheduler.optim_objs else 0.002
             avg_loss = epoch_loss / len(train_loader)
-            if epoch % 100 == 0 or epoch == 19999:
+            if epoch % 100 == 0 or epoch == 4999:
                 print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {epoch_ll:.2f} | Btea KL: {epoch_kl:.2f}, | Original KL: {epoch_kl/current_kl_weight:.2f}")
     
     # 6. SAVE MODEL & SCALER
     # Save parameters for the BNN weights
-    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_20000.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_full_d.pt")
     # Save the Y-Scaler to convert predictions back to seconds
-    joblib.dump(scaler_y, "y_scaler_4_fixed_20000.pkl")
+    joblib.dump(scaler_y, "y_scaler_4_full_d.pkl")
     print("\nModel weights and scaler saved successfully.")
         
         
@@ -463,7 +464,7 @@ if __name__ == "__main__":
     # ==========================================
     bnn_model.eval()
     base_guide.eval()
-    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_20000.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_full_d.pt")
     print("\n--- Final Prediction Test ---")
     list_of_predict = []
     list_of_confidence = []

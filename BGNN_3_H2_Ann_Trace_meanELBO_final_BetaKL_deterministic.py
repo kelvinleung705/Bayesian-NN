@@ -23,12 +23,14 @@ num_segment = 9
 def process_raw_data(file_path):
     print(f"Reading {file_path}...")
     df = pd.read_excel(file_path, header=None, skiprows=1)
+    """
     df = df[
     #(df.iloc[:, 2] == 1) & 
     #(df.iloc[:, 7] <= 2) #&
     #(df.iloc[:, 56 ] == 5)
     (df.iloc[:, 56].isin([1, 2, 3, 4]))
     ]
+    """
     end = 14 + num_segment + 1 + (num_segment * 4)
     df_subset = df.iloc[:, 0:end]
     df_subset = df_subset.dropna()
@@ -136,7 +138,7 @@ class DeterministicNeighborMixingLayer(nn.Module):
 # 3. DETERMINISTIC "MATRIX" GNN MODEL
 # ==========================================
 class DeterministicMatrixGNN(nn.Module):
-    def __init__(self, num_sections=9, global_dim=9, local_dim=4, hidden_dim=32):
+    def __init__(self, num_sections=9, global_dim=9, local_dim=4, hidden_dim=16):
         super().__init__()
         self.num_sections = num_sections
         input_dim = global_dim + local_dim + 1 
@@ -145,7 +147,7 @@ class DeterministicMatrixGNN(nn.Module):
         
         self.prop_layers = nn.ModuleList([
             DeterministicNeighborMixingLayer(hidden_dim, hidden_dim, num_sections, dropout_rate=0.2)
-            for _ in range(3)
+            for _ in range(2)
         ])
         
         # --- Output Heads ---
@@ -160,7 +162,7 @@ class DeterministicMatrixGNN(nn.Module):
         device = global_features.device
         
         # Virtual Clock
-        current_time = torch.zeros(batch_size, self.num_sections).to(device)
+        current_time = torch.zeros(batch_size, 1).to(device)
         
         all_locs = []
         
@@ -176,7 +178,7 @@ class DeterministicMatrixGNN(nn.Module):
                     # If we are looking at the section we are currently predicting,
                     # we inject the REAL running clock time.
                     #time_i = current_time
-                    time_i = current_time[:, i:i+1] 
+                    time_i = current_time
                     #time_i = torch.zeros(batch_size, 1).to(device)
                 elif i < current_section:
                     # For sections in the PAST, we could inject their actual historical times,
@@ -184,7 +186,7 @@ class DeterministicMatrixGNN(nn.Module):
                     # or you can feed 0 if you want them to be "static anchors".
                     # Let's feed the current clock to show "how far past" they are.
                     #time_i = current_time
-                    time_i = current_time[:, i:i+1] 
+                    time_i = current_time
                     #time_i = torch.zeros(batch_size, 1).to(device)
                     
                 else:
@@ -192,7 +194,7 @@ class DeterministicMatrixGNN(nn.Module):
                     # We feed 0.0 (or you could feed current_time as a baseline).
                     # Let's feed 0.0 to indicate "unreached".
                     #time_i = torch.zeros(batch_size, 1).to(device)
-                    time_i = current_time[:, i:i+1] 
+                    time_i = torch.zeros(batch_size, 1).to(device)
                 
                 if time_i.abs().mean().item() > 15:
                     time_i = torch.zeros(batch_size, 1).to(device)
@@ -221,8 +223,7 @@ class DeterministicMatrixGNN(nn.Module):
             # 5. UPDATE THE CLOCK for the next loop iteration
             # We add the predicted travel time of THIS section to the running total.
             
-            for j in range(current_section, self.num_sections):
-                current_time[:, j:j+1] = current_time[:, j:j+1] + loc
+            current_time = current_time + loc
             
             #print(loc.abs().mean().item())
             
@@ -242,7 +243,7 @@ if __name__ == "__main__":
     x_global_all, x_local_all, y_all, scaler_y = process_raw_data(file_path)
     
     idx = np.arange(x_global_all.shape[0])
-    train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42)
+    train_idx, val_idx = train_test_split(idx, test_size=0.00001, random_state=42)
     
     x_global_train = x_global_all[train_idx].to(device)
     x_local_train = x_local_all[train_idx].to(device)
@@ -300,8 +301,8 @@ if __name__ == "__main__":
             print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | MSE Loss (Scaled): {avg_loss:.4f}")
             
     # Save Model
-    torch.save(model.state_dict(), "deterministic_model_jan_apr.pt")
-    joblib.dump(scaler_y, "deterministic_scaler_jan_apr.pkl")
+    torch.save(model.state_dict(), "deterministic_model.pt")
+    joblib.dump(scaler_y, "deterministic_scaler.pkl")
     print("Deterministic Model Saved.")
 
     # --- INFERENCE ---

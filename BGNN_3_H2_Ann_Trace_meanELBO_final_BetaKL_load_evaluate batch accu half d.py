@@ -81,84 +81,72 @@ def process_validation_data(file_path, loaded_scaler):
 # 2. MODEL ARCHITECTURE (Required for loading)
 # ==========================================
 class LocalIsolationLayer(PyroModule):
-    """
-    LAYER 1: PURELY LOCAL
-    Each segment has its own neural network.
-    NO neighbor information is used here.
-    """
-    def __init__(self, input_dim, output_dim, num_segments, device = 'cuda'):
+    def __init__(self, input_dim, output_dim, num_segments, device='cuda'):
         super().__init__()
         self.num_segments = num_segments
         self.nets = PyroModuleList([])
         
         for i in range(num_segments):
-            # Simple Linear transformation for this specific segment
             net = PyroModule[nn.Linear](input_dim, output_dim)
             zero = torch.tensor(0., device=device)
-            point_one = torch.tensor(1, device=device)
+            point_one = torch.tensor(1., device=device)
             df = torch.tensor(15., device=device)
             net.weight = PyroSample(dist.StudentT(df, zero, point_one).expand([output_dim, input_dim]).to_event(2))
             net.bias = PyroSample(dist.StudentT(df, zero, point_one).expand([output_dim]).to_event(1))
             self.nets.append(net)
             
     def forward(self, x_inputs):
-        # x_inputs is a list of tensors, one per segment
-        outputs = []
-        all_sampled_weights = []
+        outputs =[]
         for i in range(self.num_segments):
             out = torch.nn.functional.silu(self.nets[i](x_inputs[i]))
             outputs.append(out)
-            all_sampled_weights.append(self.nets[i].weight.abs().mean())
-        avg_weight = torch.stack(all_sampled_weights).mean()
-        w_std = self.nets[0].weight.std()
-        #print(f"Global Sampled Weight Mean: {avg_weight.item():.4f} | Spread (Std): {w_std.item():.4f}")
         return outputs
-    
-    
-# ==========================================
-# 2. UNIQUE MIXING LAYER (With Dropout & Weights)
-# ==========================================
-class NeighborMixingLayer(PyroModule):
+
+class NeighborMixingLayer(nn.Module): # Note: Inheriting from nn.Module, not PyroModule
+    """
+    LAYER 2: MIXING (DETERMINISTIC)
+    Each segment has its own network.
+    Input = Output of Previous Layer (Self) + Output of Previous Layer (Neighbors)
+    """
     def __init__(self, input_dim, output_dim, num_segments, dropout_rate=0.2, device='cuda'):
         super().__init__()
         self.num_segments = num_segments
         self.device = device
         
-        loc_self = torch.tensor(2., device=device)
-        loc_side = torch.tensor(0.0, device=device)
-        scale = torch.tensor(1.0, device=device)
-        zero = torch.tensor(0., device=device)
-        w_scale = torch.tensor(1.0, device=device)
-        b_scale = torch.tensor(0.1, device=device)
-
-        self.w_self = PyroSample(dist.Normal(loc_self, scale).expand([num_segments]).to_event(1))
-        self.w_right = PyroSample(dist.Normal(loc_side, scale).expand([num_segments]).to_event(1))
+        # --- DETERMINISTIC SPATIAL WEIGHTS ---
+        # Instead of Bayesian priors, these are standard learnable parameters.
+        # We initialize them similarly (Self=2.0, Right=0.0) so the network
+        # starts by prioritizing local information.
+        self.w_self = nn.Parameter(torch.full((num_segments,), 2.0, device=device))
+        self.w_right = nn.Parameter(torch.zeros(num_segments, device=device))
         
-        self.nets_1 = PyroModuleList([])
-        self.nets_2 = PyroModuleList([])
+        # --- DETERMINISTIC NEURAL NETWORKS ---
+        # We use standard nn.ModuleList and nn.Linear
+        self.nets_1 = nn.ModuleList([])
+        self.nets_2 = nn.ModuleList([])
         
         for i in range(num_segments):
             net_input_dim = input_dim * 2
-            net_1 = PyroModule[nn.Linear](net_input_dim, output_dim)
-            net_1.weight = PyroSample(dist.Normal(zero, w_scale).expand([output_dim, net_input_dim]).to_event(2))
-            net_1.bias = PyroSample(dist.Normal(zero, b_scale).expand([output_dim]).to_event(1))
+            
+            # Standard Linear layers automatically initialize their weights deterministically
+            net_1 = nn.Linear(net_input_dim, output_dim, device=device)
             self.nets_1.append(net_1)
     
-        self.dropout_1 = PyroModule[nn.Dropout](p=dropout_rate)
+        self.dropout_1 = nn.Dropout(p=dropout_rate)
         
         for i in range(num_segments):
-            net_2 = PyroModule[nn.Linear](output_dim, output_dim)
-            net_2.weight = PyroSample(dist.Normal(zero, w_scale).expand([output_dim, output_dim]).to_event(2))
-            net_2.bias = PyroSample(dist.Normal(zero, b_scale).expand([output_dim]).to_event(1))
+            net_2 = nn.Linear(output_dim, output_dim, device=device)
             self.nets_2.append(net_2)
         
-        self.dropout_2 = PyroModule[nn.Dropout](p=dropout_rate)
+        self.dropout_2 = nn.Dropout(p=dropout_rate)
         
     def forward(self, prev_layer_outputs):
-        outputs =[]
+        outputs = []
         for i in range(self.num_segments):
+            # Apply softplus to ensure weights remain positive during training
             ws = torch.nn.functional.softplus(self.w_self[i])
             wr = torch.nn.functional.softplus(self.w_right[i])
+            
             self_feat = prev_layer_outputs[i] * ws
             
             if i < self.num_segments - 1:
@@ -177,9 +165,8 @@ class NeighborMixingLayer(PyroModule):
             out = torch.nn.functional.silu(out)
             
             outputs.append(out)
+            
         return outputs
-
-
 # ==========================================
 # 3. THE "MATRIX" GNN MODEL
 # ==========================================
@@ -201,9 +188,9 @@ class MatrixGNN(PyroModule):
         # We create N layers. Each layer contains N unique networks.
         self.prop_layers = PyroModuleList([
             NeighborMixingLayer(hidden_dim, hidden_dim, num_sections, dropout_rate=0.2, device=device)
-            for _ in range(2) # Layer depth = num_segments
+            for _ in range(3) # Layer depth = num_segments
         ])
-                
+        
         # --- Output Heads ---
         final_dim = hidden_dim
         
@@ -223,7 +210,7 @@ class MatrixGNN(PyroModule):
             scale_bias_mu = torch.tensor(0., device=device)
             scale_bias_std = torch.tensor(3.0, device=device)
 
-            df_std = torch.tensor(1, device=device)
+            df_std = torch.tensor(1., device=device)
             df_bias_mu = torch.tensor(0., device=device)
             df_bias_std = torch.tensor(3.0, device=device)
             
@@ -244,13 +231,14 @@ class MatrixGNN(PyroModule):
             h_df.weight = PyroSample(dist.Normal(zero, df_std).expand([1, final_dim]).to_event(2))
             h_df.bias = PyroSample(dist.Normal(df_bias_mu, df_bias_std).expand([1]).to_event(1))
             self.heads_df.append(h_df)
-
+            
     def forward(self, global_features, all_sections_data):
         batch_size = global_features.shape[0]
         device = global_features.device
         
         # Initialize a single running clock (not a vector of zeros for all sections)
-        current_time = torch.zeros(batch_size, 1).to(self.device)
+        #current_time = torch.zeros(batch_size, 1).to(device)
+        current_time = torch.zeros(batch_size, 1).to(device)
         
         all_locs = []
         all_scales = []
@@ -264,32 +252,16 @@ class MatrixGNN(PyroModule):
                 loc_i = all_sections_data[:, i, :]
                 # THE CRITICAL INJECTION LOGIC
                 if i == current_section:
-                    # If we are looking at the section we are currently predicting,
-                    # we inject the REAL running clock time.
                     time_i = current_time
-                    #time_i = current_time[:, i:i+1] 
-                    #time_i = torch.zeros(batch_size, 1).to(device)
                 elif i < current_section:
-                    # For sections in the PAST, we could inject their actual historical times,
-                    # but for simplicity, feeding the current clock is often enough, 
-                    # or you can feed 0 if you want them to be "static anchors".
-                    # Let's feed the current clock to show "how far past" they are.
                     time_i = current_time
-                    #time_i = current_time[:, i:i+1] 
-                    #time_i = torch.zeros(batch_size, 1).to(device)
-                    
                 else:
-                    # For sections in the FUTURE, we don't know the time yet.
-                    # We feed 0.0 (or you could feed current_time as a baseline).
-                    # Let's feed 0.0 to indicate "unreached".
                     #time_i = torch.zeros(batch_size, 1).to(device)
-                    time_i = current_time
-                    #time_i = current_time[:, i:i+1] 
-                if time_i.abs().sum() > 0:
-                    time_i_stable = self.time_norm(time_i)
-                else:
-                    time_i_stable = time_i
-                inp = torch.cat([global_features, loc_i, time_i_stable], dim=1)
+                    time_i = torch.zeros(batch_size, 1).to(device)
+                
+                if time_i.abs().mean().item() > 15:
+                    time_i = torch.zeros(batch_size, 1).to(device)
+                inp = torch.cat([global_features, loc_i, time_i], dim=1)
                 inputs_list.append(inp)
                 
             # 2. Run the full GNN (Embedding + Mixing) to get context
@@ -302,10 +274,6 @@ class MatrixGNN(PyroModule):
             final_feat = h_current[current_section] 
             
             loc = self.heads_loc[current_section](final_feat)
-            if self.pnt_1 is True:
-                self.pnt_1 = False
-                #print(loc)
-            #print("loc:", loc.mean().item())
             scale = torch.nn.functional.softplus(self.heads_scale[current_section](final_feat)) + 1e-3 
             df = torch.nn.functional.softplus(self.heads_df[current_section](final_feat)) + 2.5
             
@@ -313,19 +281,13 @@ class MatrixGNN(PyroModule):
             all_locs.append(loc)
             all_scales.append(scale)
             all_dfs.append(df)
-            #print(all_locs[-1].mean().item())
-            #print(all_locs[-1].mean().item())
             # 5. UPDATE THE CLOCK for the next loop iteration
             # We add the predicted travel time of THIS section to the running total.
             
             current_time = current_time + loc
-            
-            #print(loc.abs().mean().item())
-            
-            #current_time = current_time + loc
+                
             
         return all_locs, all_scales, all_dfs
-
 
 def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
     with pyro.poutine.scale(scale=kl_weight):
@@ -345,13 +307,16 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     #trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy
-    saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu_flat.pt" # Replace with exact saved params file name
-    #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu_Jan_to_Apr.pt" # Replace with exact saved params file name
     #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu.pt" # Replace with exact saved params file name
+    saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_half_d.pt" # Replace with exact saved params file name
+    #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu_Jan_to_Apr.pt" # Replace with exact saved params file name
+    #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed.pt" # Replace with exact saved params file name
     
-    #saved_scaler_path = "y_scaler_1.pkl"              # Replace with exact saved scaler file name
+    #saved_scaler_path = "y_scaler_1.pkl"  
+    saved_scaler_path = "y_scaler_4_half_d.pkl"  
+    #saved_scaler_path = "y_scaler_4_fixed.pkl"              # Replace with exact saved scaler file name
     #saved_scaler_path = "y_scaler_Jan_to_Apr.pkl" 
-    saved_scaler_path = "y_scaler_flat.pkl"   
+    #saved_scaler_path = "y_scaler_4_trash.pkl"   
     #file_path = "bad_visibility.xlsx"
     file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_month_sorted.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
@@ -380,7 +345,7 @@ if __name__ == "__main__":
     # Load ParamStore FIRST so the Guide correctly latches onto the loaded weights
     pyro.get_param_store().load(saved_params_path, map_location=device.type)
 
-    bnn_model = MatrixGNN(num_sections=num_segment, global_dim=9, local_dim=4, hidden_dim=32, device=device).to(device)
+    bnn_model = MatrixGNN(num_sections=num_segment, global_dim=9, local_dim=4, hidden_dim=16, device=device).to(device)
     base_guide = AutoDiagonalNormal(model_fn).to(device)
     bnn_model.eval()
     base_guide.eval()
@@ -437,7 +402,7 @@ class NetronExportWrapper(nn.Module):
     val_dataset = TensorDataset(x_global_val, x_local_val, y_val)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    predictive = Predictive(model_fn, guide=guide_fn, num_samples=50)
+    predictive = Predictive(model_fn, guide=guide_fn, num_samples=200)
     
     all_pred_real = []
     all_actual_real = []
@@ -526,16 +491,25 @@ class NetronExportWrapper(nn.Module):
     # Warning: Printing thousands of lines to the console is very slow!
     # I recommend keeping this to the first 5 samples just to verify, 
     # but I have left the full loop here in case you need it.
+    max_pred = 0
+    max_conf = 0
     
     print_limit = len(x_global_val) # Change this to 5 if you just want a quick peek
     all_loc = 0
     all_std = 0
+    overload = 0
     for j in range(print_limit):
+        if total_pred[j] > 2000 or total_std[j] > 500:
+            overload += 1
+        
         print(f"\n--- Sample {j} ---")
         for i in range(num_segment):
             is_in_bound = "YES" if sec_within_bounds_mask[j, i] else "NO"
             print(f"  Sec {i}: Pred {pred_real[j, i]:.1f}s | Actual {actual_real[j, i]:.1f}s | Conf +/- {std_real[j, i]:.1f}s | Within Bound? {is_in_bound}")
-            
+        if total_pred[j] > max_pred:
+            max_pred = total_pred[j]
+        if total_std[j] > max_conf:
+            max_conf = total_std[j]
         print(f"\nTotal ETA: {total_pred[j]:.2f} seconds (Actual: {total_act[j]:.2f})")
         print(f"Within Bound? : {'YES' if within_bound_mask[j] else 'NO'}")
         print(f"Confidence: +/- {total_std[j]:.2f} seconds")
@@ -543,7 +517,7 @@ class NetronExportWrapper(nn.Module):
         all_std += total_std[j]
         conf_level = total_pred[j] / total_std[j] if total_std[j] > 0 else 0
         print(f"Confidence Level: {conf_level:.2f}")
-        
+    
         # Current running error metrics
         current_error_tendency = np.sum(error_rates[:j+1]) / (j + 1)
         current_error_squared = np.sum(abs_errors[:j+1]) / (j + 1)
@@ -562,3 +536,6 @@ class NetronExportWrapper(nn.Module):
     print(f"平均預測時間: {all_loc / print_limit:.2f}")
     print(f"平均置信度: {all_std / print_limit:.2f}")
     print("==============================================")
+    print(max_pred)
+    print(max_conf)
+    print(overload)
