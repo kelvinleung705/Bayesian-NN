@@ -357,7 +357,7 @@ if __name__ == "__main__":
             return base_guide(x_global, x_local, y_true, total_size=total_size, kl_weight=kl_weight)
     
     # 3. PYRO OPTIMIZER & SCHEDULER (Fixed)
-    CYCLE_LENGTH = 2500  # Sync LR and KL cycles
+    CYCLE_LENGTH = 2000  # Sync LR and KL cycles
     
     # Wrap PyTorch optimizer and scheduler the Pyro way
     optimizer_args = {
@@ -381,7 +381,7 @@ if __name__ == "__main__":
 
     print("\n--- Starting Training ---")
     
-    epochs = 10000
+    epochs = 8000
     batch_size = 1024
     train_dataset = TensorDataset(x_global_train, x_local_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -396,7 +396,7 @@ if __name__ == "__main__":
         # 4. PERFECTLY SYNCHRONIZED KL ANNEALING
         # This replaces the external Annealer to ensure exact syncing with the LR Restart
         relative_epoch = epoch % CYCLE_LENGTH
-        ramp_epochs = 1250  # Spend 1500 epochs ramping up, 1000 epochs holding at 1.0
+        ramp_epochs = 1000  # Spend 1500 epochs ramping up, 1000 epochs holding at 1.0
         max_beta = 1.0  # Max KL weight (equivalent to saying "Data is 10x more important than Prior")
         if relative_epoch < ramp_epochs:
             # Linear ramp from ~0.001 to 1.0 (Floor of 0.001 prevents distribution collapse on restart)
@@ -438,7 +438,7 @@ if __name__ == "__main__":
     
     # 6. SAVE MODEL & SCALER
     # Save parameters for the BNN weights
-    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_10000_new_encoding.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_KL_9_accu4_fixed_8000_new_encoding.pt")
     # Save the Y-Scaler to convert predictions back to seconds
     joblib.dump(scaler_y, "y_scaler_4_fixed_10000.pkl")
     print("\nModel weights and scaler saved successfully.")
@@ -462,7 +462,7 @@ if __name__ == "__main__":
     # ==========================================
     bnn_model.eval()
     base_guide.eval()
-    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_10000_new_encoding.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_KL_9_accu4_fixed_8000_new_encoding.pt")
     print("\n--- Final Prediction Test ---")
     list_of_predict = []
     list_of_confidence = []
