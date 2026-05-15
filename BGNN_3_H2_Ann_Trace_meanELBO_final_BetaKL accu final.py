@@ -363,7 +363,7 @@ if __name__ == "__main__":
     optimizer_args = {
         "optimizer": torch.optim.AdamW,
         #"optim_args": {"lr": 0.001, "weight_decay": 0.01}
-        "optim_args": {"lr": 0.0005, "weight_decay": 0.0}
+        "optim_args": {"lr": 0.001, "weight_decay": 0.0}
     }
     
     def scheduler_constructor(optim):
@@ -440,7 +440,7 @@ if __name__ == "__main__":
     # Save parameters for the BNN weights
     pyro.get_param_store().save("ghost_bus_model_cycle_KL_9_accu4_fixed_8000_new_encoding.pt")
     # Save the Y-Scaler to convert predictions back to seconds
-    joblib.dump(scaler_y, "y_scaler_4_fixed_10000.pkl")
+    joblib.dump(scaler_y, "y_scaler_4_fixed_8000.pkl")
     print("\nModel weights and scaler saved successfully.")
         
         
