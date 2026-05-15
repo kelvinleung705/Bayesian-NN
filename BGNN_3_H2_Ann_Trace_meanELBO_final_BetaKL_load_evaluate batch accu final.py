@@ -1,4 +1,5 @@
 import statistics
+from onnx import save
 import torch
 import torch.nn as nn
 import pyro
@@ -306,17 +307,23 @@ if __name__ == "__main__":
     #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu.pt" # Replace with exact saved params file name
     #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu_Jan_to_Apr.pt" # Replace with exact saved params file name
     saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed.pt" # Replace with exact saved params file name
+    #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_20000_new_encoding.pt"
+    #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_10000_new_encoding.pt"
     
     #saved_scaler_path = "y_scaler_1.pkl"  
     saved_scaler_path = "y_scaler_4_fixed.pkl"              # Replace with exact saved scaler file name
+    #saved_scaler_path = "y_scaler_4_fixed_20000.pkl"              # Replace with exact saved scaler file name
     #saved_scaler_path = "y_scaler_Jan_to_Apr.pkl" 
     #saved_scaler_path = "y_scaler_4_trash.pkl"   
+    #saved_scaler_path = "y_scaler_4_fixed_10000.pkl"              # Replace with exact saved scaler file name
     #file_path = "bad_visibility.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_month_sorted.xlsx"
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
+    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy2_flagged.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_40.xlsx"
+    
     
     # ==========================================
     # 1. LOAD SCALER & DATA

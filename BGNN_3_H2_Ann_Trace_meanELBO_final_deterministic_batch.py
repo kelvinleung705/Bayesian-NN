@@ -233,8 +233,8 @@ if __name__ == "__main__":
     #saved_scaler_path = "deterministic_scaler_jan_apr.pkl"  
     saved_scaler_path = "deterministic_scaler.pkl"  
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_month_sorted.xlsx"  # Ensure this is the correct path to your validation data            
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
-    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
+    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
     
     # ==========================================
     # 1. LOAD SCALER & DATA
@@ -313,7 +313,7 @@ if __name__ == "__main__":
     total_samples = len(total_act)
 
     # --- HARDCODED MARGIN FOR COVERAGE CALCULATION ---
-    hardcoded_margin = 99  # Seconds
+    hardcoded_margin = 80  # Seconds
     
     lower_bound = total_pred - hardcoded_margin
     upper_bound = total_pred + hardcoded_margin

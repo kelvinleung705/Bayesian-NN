@@ -281,36 +281,33 @@ def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0): #k
             target = y_true[:, i] if y_true is not None else None
             pyro.sample(f"obs_section_{i}", dist_i, obs=target)
             
-def get_ll_kl(model_fn, guide, x_g, x_l, y, total_size, kl_weight):
-    # Sample latent variables from guide
-    guide_trace = pyro.poutine.trace(guide).get_trace(x_g, x_l, y, total_size=total_size, kl_weight=kl_weight)
-    
-    # Replay model with those same samples
+def get_ll_kl(model_fn, guide, x_g, x_l, y, total_size):
+    # Always use kl_weight=1.0 — we want true LL and true KL, not the annealed versions
+    guide_trace = pyro.poutine.trace(guide).get_trace(
+        x_g, x_l, y, total_size=total_size, kl_weight=1.0
+    )
     model_trace = pyro.poutine.trace(
         pyro.poutine.replay(model_fn, trace=guide_trace)
-    ).get_trace(x_g, x_l, y, total_size=total_size, kl_weight=kl_weight)
-    
+    ).get_trace(x_g, x_l, y, total_size=total_size, kl_weight=1.0)
+
     model_trace.compute_log_prob()
     guide_trace.compute_log_prob()
-    
+
     ll = 0.0
     kl = 0.0
-    
+
     for name, site in model_trace.nodes.items():
         if site["type"] != "sample":
             continue
-        
         if site["is_observed"]:
-            # Likelihood terms — obs_section_0, obs_section_1, etc.
             ll += site["log_prob_sum"]
         else:
-            # Prior terms — BNN weights
             if name not in guide_trace.nodes:
                 continue
             log_p = site["log_prob_sum"]
             log_q = guide_trace.nodes[name]["log_prob_sum"]
-            kl += log_q - log_p  # KL = E[log q - log p]
-    
+            kl += log_q - log_p
+
     return ll.item(), kl.item()
 
 if __name__ == "__main__":
@@ -330,7 +327,8 @@ if __name__ == "__main__":
     
     # [Assuming process_raw_data and MatrixGNN are defined above]
     #file_path = "trip_info_9_section_ver2_simplify_ultra.xlsx"
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_sorted.xlsx"
+    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_sorted.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_40.xlsx"
     x_global_all, x_local_all, y_all, scaler_y = process_raw_data(file_path)
     
     idx = np.arange(x_global_all.shape[0])
@@ -359,7 +357,7 @@ if __name__ == "__main__":
             return base_guide(x_global, x_local, y_true, total_size=total_size, kl_weight=kl_weight)
     
     # 3. PYRO OPTIMIZER & SCHEDULER (Fixed)
-    CYCLE_LENGTH = 5000  # Sync LR and KL cycles
+    CYCLE_LENGTH = 2500  # Sync LR and KL cycles
     
     # Wrap PyTorch optimizer and scheduler the Pyro way
     optimizer_args = {
@@ -383,7 +381,7 @@ if __name__ == "__main__":
 
     print("\n--- Starting Training ---")
     
-    epochs = 20000
+    epochs = 10000
     batch_size = 1024
     train_dataset = TensorDataset(x_global_train, x_local_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -398,7 +396,7 @@ if __name__ == "__main__":
         # 4. PERFECTLY SYNCHRONIZED KL ANNEALING
         # This replaces the external Annealer to ensure exact syncing with the LR Restart
         relative_epoch = epoch % CYCLE_LENGTH
-        ramp_epochs = 2500  # Spend 1500 epochs ramping up, 1000 epochs holding at 1.0
+        ramp_epochs = 1250  # Spend 1500 epochs ramping up, 1000 epochs holding at 1.0
         max_beta = 1.0  # Max KL weight (equivalent to saying "Data is 10x more important than Prior")
         if relative_epoch < ramp_epochs:
             # Linear ramp from ~0.001 to 1.0 (Floor of 0.001 prevents distribution collapse on restart)
@@ -419,29 +417,30 @@ if __name__ == "__main__":
         # 5. CRITICAL: Step the scheduler at the epoch level!
         scheduler.step()
         
-        with torch.no_grad():
-            ll, kl = get_ll_kl(
-                model_fn, guide_fn,
-                x_g_batch, x_l_batch, y_batch,  # use last batch as proxy, or full data
-                total_size=total_size,
-                kl_weight=current_kl_weight
-            )
-            epoch_ll += ll
-            epoch_kl += kl
+        
 
         # Print detailed logging occasionally
         if epoch % 1 == 0 or epoch == epochs - 1:
+            with torch.no_grad():
+                ll, kl = get_ll_kl(
+                    model_fn, guide_fn,
+                    x_g_batch, x_l_batch, y_batch,  # use last batch as proxy, or full data
+                    total_size=total_size,
+                    #kl_weight=current_kl_weight
+                )
+            epoch_ll += ll
+            epoch_kl += kl
             # Safely extract current LR from Pyro's internal dictionary
             current_lr = list(scheduler.optim_objs.values())[0].optimizer.param_groups[0]["lr"] if scheduler.optim_objs else 0.002
             avg_loss = epoch_loss / len(train_loader)
-            if epoch % 100 == 0 or epoch == 19999:
-                print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {epoch_ll:.2f} | Btea KL: {epoch_kl:.2f}, | Original KL: {epoch_kl/current_kl_weight:.2f}")
+            if epoch % 100 == 0 or epoch == epochs - 1:
+                print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {ll:.2f} | Btea KL: {kl:.2f}, | ELBO check: {ll - kl:.2f}, | Original KL: {epoch_kl/current_kl_weight:.2f}")
     
     # 6. SAVE MODEL & SCALER
     # Save parameters for the BNN weights
-    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_20000.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_10000_new_encoding.pt")
     # Save the Y-Scaler to convert predictions back to seconds
-    joblib.dump(scaler_y, "y_scaler_4_fixed_20000.pkl")
+    joblib.dump(scaler_y, "y_scaler_4_fixed_10000.pkl")
     print("\nModel weights and scaler saved successfully.")
         
         
@@ -463,7 +462,7 @@ if __name__ == "__main__":
     # ==========================================
     bnn_model.eval()
     base_guide.eval()
-    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_20000.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_10000_new_encoding.pt")
     print("\n--- Final Prediction Test ---")
     list_of_predict = []
     list_of_confidence = []

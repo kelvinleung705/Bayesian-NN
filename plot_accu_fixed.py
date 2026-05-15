@@ -31,7 +31,7 @@ def process_validation_data(file_path, loaded_scaler):
     
     df = df[
     (df.iloc[:, 2] == 1) & 
-    (df.iloc[:, 7] <= 2) #&
+    (df.iloc[:, 7] > 2) #&
     #(df.iloc[:, 56].isin([5]))
     ]
     
@@ -289,10 +289,12 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed.pt" # Replace with exact saved params file name
+    #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed.pt" # Replace with exact saved params file name
+    saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_10000_new_encoding.pt"
     
     #saved_scaler_path = "y_scaler_1.pkl"              # Replace with exact saved scaler file name
-    saved_scaler_path = "y_scaler_4_fixed.pkl"              # Replace with exact saved scaler file name
+    #saved_scaler_path = "y_scaler_4_fixed.pkl"              # Replace with exact saved scaler file name
+    saved_scaler_path = "y_scaler_4_fixed_10000.pkl"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_month_sorted.xlsx"
     file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
     #file_path = "bad_visibility.xlsx"
@@ -590,7 +592,7 @@ if __name__ == "__main__":
     
     # Save the output file
     #output_filename = 'ghost_bus_accu_results_bollinger_weekend.png'
-    output_filename = 'ghost_bus_accu2_results_bollinger_weekday_good_weather_2026.png'
+    output_filename = 'ghost_bus_accu2_results_bollinger_weekday_bad_weather_2026.png'
     plt.savefig(output_filename, dpi=300, bbox_inches='tight')
     print(f"\nSUCCESS! Plot saved as: {output_filename}")
     
