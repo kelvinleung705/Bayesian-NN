@@ -364,7 +364,8 @@ if __name__ == "__main__":
     # Wrap PyTorch optimizer and scheduler the Pyro way
     optimizer_args = {
         "optimizer": torch.optim.AdamW,
-        "optim_args": {"lr": 0.001, "weight_decay": 0.01}
+        "optim_args": {"lr": 0.001, "weight_decay": 0.00}
+        #0.01
     }
     
     def scheduler_constructor(optim):
@@ -398,7 +399,7 @@ if __name__ == "__main__":
         # This replaces the external Annealer to ensure exact syncing with the LR Restart
         relative_epoch = epoch % CYCLE_LENGTH
         ramp_epochs =500  # Spend 1500 epochs ramping up, 1000 epochs holding at 1.0
-        max_beta = 0.11  # Max KL weight (equivalent to saying "Data is 10x more important than Prior")
+        max_beta = 1  # Max KL weight (equivalent to saying "Data is 10x more important than Prior")
         if relative_epoch < ramp_epochs:
             # Linear ramp from ~0.001 to 1.0 (Floor of 0.001 prevents distribution collapse on restart)
             current_kl_weight = max(0.00001, (relative_epoch / ramp_epochs)*max_beta)
