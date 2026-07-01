@@ -285,11 +285,9 @@ class MatrixGNN(PyroModule):
                     #time_i = torch.zeros(batch_size, 1).to(device)
                     time_i = current_time
                     #time_i = current_time[:, i:i+1] 
-                if time_i.abs().sum() > 0:
-                    time_i_stable = self.time_norm(time_i)
-                else:
-                    time_i_stable = time_i
-                inp = torch.cat([global_features, loc_i, time_i_stable], dim=1)
+                if time_i.abs().mean().item() > 15:
+                    time_i = torch.zeros(batch_size, 1).to(device)
+                inp = torch.cat([global_features, loc_i, time_i], dim=1)
                 inputs_list.append(inp)
                 
             # 2. Run the full GNN (Embedding + Mixing) to get context

@@ -1,0 +1,260 @@
+"""
+matrix_gnn_vae_evaluate_fast
+==============================
+Batched GPU inference for MatrixGNN_VAE.
+Processes all 7332 trips in large batches instead of one at a time.
+
+Speed comparison:
+  Old: 1 sample/s  (Predictive re-traces every call, GPU ~5% util)
+  New: ~100-500x faster  (one Predictive call over all data, GPU ~90% util)
+"""
+
+import statistics
+import numpy as np
+import torch
+import pyro
+from pyro.infer import Predictive, SVI, Trace_ELBO
+from pyro.infer.autoguide import AutoDiagonalNormal
+import joblib
+
+from matrix_gnn_vae import (
+    MatrixGNN_VAE,
+    model_fn,
+    process_raw_data,
+    num_segment,
+    LATENT_DIM,
+)
+
+# ==========================================
+# CONFIG
+# ==========================================
+PARAMS_PATH  = "ghost_bus_vae.pt"
+SCALER_PATH  = "y_scaler_vae.pkl"
+DATA_PATH    = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_new.xlsx"
+HIDDEN_DIM   = 13
+MC_SAMPLES   = 50
+INFER_BATCH  = 512   # tune up/down depending on your VRAM
+                     # 512 * 50 MC samples should fit in ~8GB VRAM
+
+
+# ==========================================
+# LOAD MODEL  (same warm-up strategy as v2)
+# ==========================================
+
+def load_model(params_path, device):
+    import matrix_gnn_vae as _m
+    pyro.clear_param_store()
+
+    bnn_model = MatrixGNN_VAE(
+        num_sections=num_segment,
+        global_dim=9,
+        local_dim=4,
+        hidden_dim=HIDDEN_DIM,
+        latent_dim=LATENT_DIM,
+        device=device,
+    ).to(device)
+    _m.bnn_model = bnn_model
+
+    base_guide = AutoDiagonalNormal(model_fn).to(device)
+
+    def guide_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
+        base_guide(x_global, x_local, y_true=y_true, total_size=total_size, kl_weight=kl_weight)
+
+    # Warm up with exact same call signature as training
+    WARMUP_BATCH = 734
+    TOTAL_SIZE   = 7332
+    dummy_g = torch.zeros(WARMUP_BATCH, 9,             device=device)
+    dummy_l = torch.zeros(WARMUP_BATCH, num_segment, 4, device=device)
+    dummy_y = torch.zeros(WARMUP_BATCH, num_segment,   device=device)
+
+    optimizer = pyro.optim.Adam({"lr": 0.001})
+    svi = SVI(model_fn, guide_fn, optimizer, loss=Trace_ELBO())
+    svi.step(dummy_g, dummy_l, dummy_y,
+             total_size=TOTAL_SIZE, kl_weight=0.00001)
+
+    warmup_n = sum(v.numel() for v in pyro.get_param_store().values())
+    print(f"Warm-up params: {warmup_n}")
+
+    pyro.get_param_store().load(params_path, map_location=device)
+    loaded_n = sum(v.numel() for v in pyro.get_param_store().values())
+    print(f"Checkpoint params: {loaded_n}")
+
+    if warmup_n != loaded_n:
+        raise RuntimeError(
+            f"Param mismatch: warm-up={warmup_n} vs checkpoint={loaded_n}. "
+            f"Check HIDDEN_DIM={HIDDEN_DIM} and LATENT_DIM={LATENT_DIM}."
+        )
+
+    bnn_model.eval()
+    base_guide.eval()
+    return bnn_model, guide_fn
+
+
+# ==========================================
+# FAST BATCHED INFERENCE
+# ==========================================
+
+def run_inference_fast(x_global_val, x_local_val, y_val,
+                       guide_fn, scaler_y, device):
+    import time
+    n = x_global_val.shape[0]
+
+    # ── Build Predictive once — reuse across all batches
+    predictive = Predictive(model_fn, guide=guide_fn, num_samples=MC_SAMPLES)
+
+    # ── Output buffers  [n, num_segment]
+    all_pred_means = np.zeros((n, num_segment), dtype=np.float32)
+    all_pred_stds  = np.zeros((n, num_segment), dtype=np.float32)
+    all_actuals    = np.zeros((n, num_segment), dtype=np.float32)
+
+    print(f"\nRunning batched inference  "
+          f"(n={n}, MC={MC_SAMPLES}, batch={INFER_BATCH})...")
+    t0 = time.time()
+
+    # ── Single pass over all data in large batches
+    for start in range(0, n, INFER_BATCH):
+        end     = min(start + INFER_BATCH, n)
+        batch_g = x_global_val[start:end]   # [B, 9]
+        batch_l = x_local_val[start:end]    # [B, 9, 4]
+
+        with torch.no_grad():
+            # samples[f"obs_section_{i}"] shape: [MC_SAMPLES, B]
+            samples = predictive(batch_g, batch_l)
+
+        for i in range(num_segment):
+            sec = samples[f"obs_section_{i}"]   # [MC, B]
+            all_pred_means[start:end, i] = sec.mean(dim=0).cpu().numpy()
+            all_pred_stds[start:end,  i] = sec.std(dim=0).cpu().numpy()
+
+        all_actuals[start:end] = y_val[start:end].cpu().numpy()
+
+        elapsed = time.time() - t0
+        rate    = (end) / elapsed
+        eta     = (n - end) / rate if rate > 0 else 0
+        print(f"  {end:5d}/{n}  |  {rate:.0f} trips/s  |  ETA {eta:.1f}s",
+              end='\r', flush=True)
+
+    elapsed = time.time() - t0
+    print(f"\nInference done in {elapsed:.1f}s  ({n/elapsed:.0f} trips/s)")
+
+    # ── Inverse transform all at once  [n, num_segment] → seconds
+    pred_real   = scaler_y.inverse_transform(all_pred_means)   # [n, S]
+    actual_real = scaler_y.inverse_transform(all_actuals)       # [n, S]
+    std_real    = all_pred_stds * scaler_y.scale_[np.newaxis, :]# [n, S]
+
+    # ── Compute stats
+    _print_results(pred_real, actual_real, std_real, n)
+
+
+def _print_results(pred_real, actual_real, std_real, n):
+    """Vectorised stats + per-sample print."""
+    # ── Per-segment within-CI  [n, S]
+    lo = pred_real - std_real
+    hi = pred_real + std_real
+    seg_within = ((actual_real >= lo) & (actual_real <= hi))   # [n, S] bool
+
+    # ── Trip-level
+    total_pred = pred_real.sum(axis=1)    # [n]
+    total_act  = actual_real.sum(axis=1)  # [n]
+    # Propagate CI: sqrt(sum of variances)
+    total_std  = np.sqrt((std_real ** 2).sum(axis=1))  # [n]
+
+    trip_within = ((total_act >= total_pred - total_std) &
+                   (total_act <= total_pred + total_std))  # [n] bool
+    
+    # ── Running standard deviations up to each sample j
+    pred_running_std = [np.std(total_pred[: j + 1]) for j in range(n)]
+    conf_running_std = [np.std(total_std[: j + 1]) for j in range(n)]
+    act_running_std = [np.std(total_act[: j + 1]) for j in range(n)]
+
+    # ── Per-sample print
+    for j in range(n):
+        print(f"\n--- Sample {j} ---")
+        for i in range(num_segment):
+            print(
+                f"  Sec {i}: "
+                f"Pred {pred_real[j,i]:6.1f}s | "
+                f"Actual {actual_real[j,i]:6.1f}s | "
+                f"Conf ±{std_real[j,i]:5.1f}s | "
+                f"{'YES' if seg_within[j,i] else 'NO'}"
+            )
+        print(f"\n  Total ETA : {total_pred[j]:.1f}s  "
+              f"(Actual: {total_act[j]:.1f}s)")
+        print(f"  Conf      : ±{total_std[j]:.1f}s  |  "
+              f"Within? {'YES' if trip_within[j] else 'NO'}")
+        print(f"  MAE so far: "
+              f"{np.abs(total_pred[:j+1] - total_act[:j+1]).mean():.1f}s  |  "
+              f"Bias: {(total_act[:j+1] - total_pred[:j+1]).mean():.1f}s")
+        print(
+            f"\nPrediction Std Deviation: {pred_running_std[j]:.2f} , "
+            f"Confidence Std Deviation: {conf_running_std[j]:.2f} , "
+            f"Actual Std Deviation: {act_running_std[j]:.2f}"
+        )        
+        within_so_far = trip_within[:j+1].sum()
+        print(f"  總共 {j+1} 筆，{within_so_far} 筆落在區間內")
+
+    # ── Final summary
+    mae  = np.abs(total_pred - total_act).mean()
+    bias = (total_act - total_pred).mean()
+    trip_cov = trip_within.mean() * 100
+    seg_cov  = seg_within.mean()  * 100
+
+    print(f"\n{'='*60}")
+    print(f"SUMMARY  ({n} trips, {MC_SAMPLES} MC samples)")
+    print(f"{'='*60}")
+    print(f"  Trip-level within CI : {trip_within.sum()}/{n}  ({trip_cov:.1f}%)")
+    print(f"  Seg-level  within CI : {seg_within.sum()}/{n*num_segment}  ({seg_cov:.1f}%)")
+    print(f"  MAE                  : {mae:.2f}s")
+    print(f"  Bias                 : {bias:.2f}s")
+    print(f"  CI ratio (mean p/σ)  : {(total_pred / np.where(total_std>0, total_std, 1)).mean():.3f}")
+
+    # ── Per-segment breakdown
+    print(f"\nPer-segment coverage:")
+    for i in range(num_segment):
+        cov = seg_within[:, i].mean() * 100
+        mae_i = np.abs(pred_real[:, i] - actual_real[:, i]).mean()
+        print(f"  Seg {i}: coverage {cov:.1f}%  |  MAE {mae_i:.1f}s")
+
+
+# ==========================================
+# MAIN
+# ==========================================
+
+if __name__ == "__main__":
+    import argparse, time
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--params",  default=PARAMS_PATH)
+    parser.add_argument("--scaler",  default=SCALER_PATH)
+    parser.add_argument("--data",    default=DATA_PATH)
+    parser.add_argument("--batch",   type=int, default=INFER_BATCH,
+                        help="Inference batch size (default 512, reduce if OOM)")
+    parser.add_argument("--mc",      type=int, default=MC_SAMPLES,
+                        help="MC posterior samples (default 50)")
+    parser.add_argument("--cpu",     action="store_true")
+    args = parser.parse_args()
+
+    INFER_BATCH = args.batch
+    MC_SAMPLES  = args.mc
+
+    device = torch.device("cpu" if args.cpu else
+                          ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"Device: {device}")
+    if device.type == 'cuda':
+        print(f"GPU   : {torch.cuda.get_device_name(0)}")
+        print(f"VRAM  : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
+
+    scaler_y = joblib.load(args.scaler)
+    print(f"Scaler: '{args.scaler}'")
+
+    x_global_all, x_local_all, y_all, _ = process_raw_data(args.data)
+    x_global_val = x_global_all.to(device)
+    x_local_val  = x_local_all.to(device)
+    y_val        = y_all.to(device)
+
+    import matrix_gnn_vae as _m
+    bnn_model, guide_fn = load_model(args.params, device)[:2]
+    _m.bnn_model = bnn_model
+
+    run_inference_fast(x_global_val, x_local_val, y_val,
+                       guide_fn, scaler_y, device)

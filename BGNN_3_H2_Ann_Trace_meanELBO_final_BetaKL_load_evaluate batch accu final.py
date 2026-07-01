@@ -200,7 +200,7 @@ class MatrixGNN(PyroModule):
             # Tensors for Heads
             zero = torch.tensor(0., device=device)
             loc_std = torch.tensor(1.0, device=device)
-            loc_bias_mu = torch.tensor(0., device=device)
+            loc_bias_mu = torch.tensor(0.3, device=device)
             loc_bias_std = torch.tensor(1., device=device)
 
             scale_std = torch.tensor(0.3, device=device)
@@ -307,9 +307,12 @@ if __name__ == "__main__":
     #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu.pt" # Replace with exact saved params file name
     #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu_Jan_to_Apr.pt" # Replace with exact saved params file name
     #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed.pt" # Replace with exact saved params file name
-    saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_20000_new_encoding.pt"
     #saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu4_fixed_10000_new_encoding.pt"
     #saved_params_path = "ghost_bus_model_cycle_KL_9_accu4_fixed_8000_new_encoding.pt"
+    #saved_params_path = "ghost_bus_model_cycle_KL_9_accu4_fixed_8000_new_encoding_0.0001.pt"
+    #saved_params_path = "ghost_bus_model_cycle_KL_9_accu4_fixed_8000_new_encoding_0.0001.pt"
+    saved_params_path = "ghost_bus_model_cycle_0.5_clamp_5_27_1055.pt" # Replace with exact saved params file name
+    print(saved_params_path)
     
     #saved_scaler_path = "y_scaler_1.pkl"  
     #saved_scaler_path = "y_scaler_4_fixed.pkl"              # Replace with exact saved scaler file name
@@ -318,13 +321,15 @@ if __name__ == "__main__":
     #saved_scaler_path = "y_scaler_Jan_to_Apr.pkl" 
     #saved_scaler_path = "y_scaler_4_trash.pkl"   
     saved_scaler_path = "y_scaler_4_fixed_8000.pkl"              # Replace with exact saved scaler file name
+    print(saved_scaler_path)   
     #file_path = "bad_visibility.xlsx"
-    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_month_sorted.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_new.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
+    #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy2_flagged.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_40.xlsx"
+    print(file_path)
     
     
     # ==========================================
@@ -566,6 +571,13 @@ class NetronExportWrapper(nn.Module):
         if total_pred[j] < total_std[j]:
             overload += 1
             list_of_extreme.append(j)
+            
+        # NORMAL / VALID CONDITION (Skips the extremes automatically)
+        else:
+            valid_loc_sum += total_pred[j]
+            valid_std_sum += total_std[j]
+            valid_count += 1
+            
             print(f"\n--- Sample {j} ---")
             for i in range(num_segment):
                 is_in_bound = "YES" if sec_within_bounds_mask[j, i] else "NO"
@@ -591,11 +603,6 @@ class NetronExportWrapper(nn.Module):
             print(f"Error (MAE running): {current_error_squared:.2f}")
             print(f"Error Tendency (Bias running): {current_error_tendency:.2f}")
 
-        # NORMAL / VALID CONDITION (Skips the extremes automatically)
-        else:
-            valid_loc_sum += total_pred[j]
-            valid_std_sum += total_std[j]
-            valid_count += 1
 
     # 2. Safely calculate averages avoiding division by zero
     avg_loc = valid_loc_sum / valid_count if valid_count > 0 else 0

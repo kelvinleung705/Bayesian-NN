@@ -425,8 +425,8 @@ if __name__ == "__main__":
     saved_params_path = "ghost_bus_model_cycle_0.1_2000_df10_KL_9_accu.pt"
     saved_scaler_path = "y_scaler.pkl"
     #trip_snapshot_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy_weather_4_D.xlsx"   # your new 9-row file
-    #trip_snapshot_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy3_flagged.xlsx"   # your new 9-row file
-    trip_snapshot_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy_40.xlsx"
+    trip_snapshot_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy3_flagged.xlsx"   # your new 9-row file
+    #trip_snapshot_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_jumpy_50.xlsx"
     output_chart_path  = "eta_convergence_accu_F.png"
 
     NUM_SAMPLES = 50   # MC samples per starting section

@@ -89,7 +89,7 @@ class NeighborMixingLayer(PyroModule):
         loc_self = torch.tensor(2., device=device)
         loc_side = torch.tensor(0.0, device=device)
         scale = torch.tensor(1.0, device=device)
-        zero = torch.tensor(0., device=device)
+        zero = torch.tensor(0.0, device=device)
         w_scale = torch.tensor(1.0, device=device)
         b_scale = torch.tensor(0.1, device=device)
 
@@ -165,7 +165,7 @@ class MatrixGNN(PyroModule):
         
         # --- Output Heads ---
         final_dim = hidden_dim
-        
+        # yuyu
         self.heads_loc = PyroModuleList([])
         self.heads_scale = PyroModuleList([])
         self.heads_df = PyroModuleList([])
@@ -173,6 +173,20 @@ class MatrixGNN(PyroModule):
         for i in range(self.num_sections):
             loc_std_dev = 2
             # Tensors for Heads
+            
+            #June
+            """
+            zero = torch.tensor(0., device=device)
+            loc_std = torch.tensor(1.5, device=device)
+            loc_bias_mu = torch.tensor(4.0, device=device)
+            loc_bias_std = torch.tensor(1., device=device)
+
+            scale_std = torch.tensor(0.1, device=device)
+            scale_bias_mu = torch.tensor(-2., device=device)
+            scale_bias_std = torch.tensor(0.5, device=device)
+            """    
+            
+            # Mmy 2
             zero = torch.tensor(0., device=device)
             loc_std = torch.tensor(1.0, device=device)
             loc_bias_mu = torch.tensor(0., device=device)
@@ -181,7 +195,7 @@ class MatrixGNN(PyroModule):
             scale_std = torch.tensor(0.3, device=device)
             scale_bias_mu = torch.tensor(0., device=device)
             scale_bias_std = torch.tensor(3.0, device=device)
-            
+                        
             three = torch.tensor(3., device=device)
             df_std = torch.tensor(1., device=device)
             df_bias_mu = torch.tensor(0., device=device)
@@ -231,8 +245,9 @@ class MatrixGNN(PyroModule):
                 else:
                     time_i = torch.zeros(batch_size, 1).to(device)
                 
-                if time_i.abs().mean().item() > 15:
-                    time_i = torch.zeros(batch_size, 1).to(device)
+                #if time_i.abs().mean().item() > 15:
+                    #time_i = torch.zeros(batch_size, 1).to(device)
+                time_i = torch.clamp(time_i, min=-15.0, max=15.0)
                 inp = torch.cat([global_features, loc_i, time_i], dim=1)
                 inputs_list.append(inp)
                 
@@ -328,7 +343,7 @@ if __name__ == "__main__":
     # [Assuming process_raw_data and MatrixGNN are defined above]
     #file_path = "trip_info_9_section_ver2_simplify_ultra.xlsx"
     #file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_sorted.xlsx"
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_40.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_new.xlsx"
     x_global_all, x_local_all, y_all, scaler_y = process_raw_data(file_path)
     
     idx = np.arange(x_global_all.shape[0])
@@ -357,13 +372,12 @@ if __name__ == "__main__":
             return base_guide(x_global, x_local, y_true, total_size=total_size, kl_weight=kl_weight)
     
     # 3. PYRO OPTIMIZER & SCHEDULER (Fixed)
-    CYCLE_LENGTH = 2000  # Sync LR and KL cycles
+    CYCLE_LENGTH = 1200  # Sync LR and KL cycles
     
     # Wrap PyTorch optimizer and scheduler the Pyro way
     optimizer_args = {
         "optimizer": torch.optim.AdamW,
-        #"optim_args": {"lr": 0.001, "weight_decay": 0.01}
-        "optim_args": {"lr": 0.001, "weight_decay": 0.0}
+        "optim_args": {"lr": 0.001, "weight_decay": 0.01}
     }
     
     def scheduler_constructor(optim):
@@ -381,8 +395,8 @@ if __name__ == "__main__":
 
     print("\n--- Starting Training ---")
     
-    epochs = 8000
-    batch_size = 1024
+    epochs = 4800
+    batch_size = 734
     train_dataset = TensorDataset(x_global_train, x_local_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     total_size = len(train_dataset)
@@ -396,13 +410,17 @@ if __name__ == "__main__":
         # 4. PERFECTLY SYNCHRONIZED KL ANNEALING
         # This replaces the external Annealer to ensure exact syncing with the LR Restart
         relative_epoch = epoch % CYCLE_LENGTH
-        ramp_epochs = 1000  # Spend 1500 epochs ramping up, 1000 epochs holding at 1.0
-        max_beta = 1.0  # Max KL weight (equivalent to saying "Data is 10x more important than Prior")
+        ramp_epochs = 600
+        down_epoch = 1200
+        max_beta = 0.9
         if relative_epoch < ramp_epochs:
-            # Linear ramp from ~0.001 to 1.0 (Floor of 0.001 prevents distribution collapse on restart)
             current_kl_weight = max(0.00001, (relative_epoch / ramp_epochs)*max_beta)
-        else:
+        elif relative_epoch < down_epoch:
             current_kl_weight = max_beta
+        #elif relative_epoch < zero_epoch:
+        #    current_kl_weight = max(0.00001, max_beta * (1 - (relative_epoch - down_epoch) / (zero_epoch - down_epoch)))
+        else:            
+            current_kl_weight = 0.00001
             
         # Training Batch Loop
         for x_g_batch, x_l_batch, y_batch in train_loader:
@@ -433,12 +451,12 @@ if __name__ == "__main__":
             # Safely extract current LR from Pyro's internal dictionary
             current_lr = list(scheduler.optim_objs.values())[0].optimizer.param_groups[0]["lr"] if scheduler.optim_objs else 0.002
             avg_loss = epoch_loss / len(train_loader)
-            if epoch % 100 == 0 or epoch == epochs - 1:
+            if epoch == 0 or relative_epoch + 1 == CYCLE_LENGTH or relative_epoch + 1 == ramp_epochs or relative_epoch + 1 == down_epoch or epoch + 1 == epochs or relative_epoch == 0:
                 print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {ll:.2f} | Btea KL: {kl:.2f}, | ELBO check: {ll - kl:.2f}, | Original KL: {epoch_kl/current_kl_weight:.2f}")
     
     # 6. SAVE MODEL & SCALER
     # Save parameters for the BNN weights
-    pyro.get_param_store().save("ghost_bus_model_cycle_KL_9_accu4_fixed_8000_new_encoding.pt")
+    pyro.get_param_store().save("ghost_bus_model_cycle_0.9_clamp_6_6_2133.pt")
     # Save the Y-Scaler to convert predictions back to seconds
     joblib.dump(scaler_y, "y_scaler_4_fixed_8000.pkl")
     print("\nModel weights and scaler saved successfully.")
