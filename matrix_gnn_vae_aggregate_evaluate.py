@@ -17,9 +17,9 @@ from matrix_gnn_vae_aggregate import (
 # ==========================================
 # CONFIG
 # ==========================================
-PARAMS_PATH  = "ghost_bus_vae_aggregate.pt"
+PARAMS_PATH  = "ghost_bus_vae_aggregate_0.5.pt"
 SCALER_PATH  = "y_scaler_vae_aggregate.pkl"
-DATA_PATH    = "trip_info_9_section_ver2_simplify_ultra_no_variance_2026.xlsx"
+DATA_PATH    = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
 HIDDEN_DIM   = 64
 MC_SAMPLES   = 200   # Changed to 200 MC Samples
 INFER_BATCH  = 512   # tune up/down depending on your VRAM
@@ -84,6 +84,11 @@ def enable_mc_dropout(model):
 # ==========================================
 # FAST BATCHED INFERENCE (WITH 200 MC SAMPLES)
 # ==========================================
+def enable_mc_dropout(model):
+        for m in model.modules():
+            if m.__class__.__name__.startswith('Dropout'):
+                m.train()
+
 
 def run_inference_fast(x_global_val, x_local_val, y_val, bnn_model, scaler_y, device):
     import time
@@ -101,7 +106,6 @@ def run_inference_fast(x_global_val, x_local_val, y_val, bnn_model, scaler_y, de
     # Prepare model for MC Dropout Inference
     bnn_model.eval()
     enable_mc_dropout(bnn_model)
-
     # ── Single pass over all data in large batches
     with torch.no_grad():
         for start in range(0, n, INFER_BATCH):
