@@ -17,7 +17,7 @@ from matrix_gnn_vae_aggregate import (
 # ==========================================
 # CONFIG
 # ==========================================
-PARAMS_PATH  = "ghost_bus_vae_aggregate_0.5.pt"
+PARAMS_PATH  = "ghost_bus_vae_aggregate_0.7.pt"
 SCALER_PATH  = "y_scaler_vae_aggregate.pkl"
 DATA_PATH    = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_June.xlsx"
 HIDDEN_DIM   = 64

@@ -324,6 +324,7 @@ class DecoderTheta(nn.Module):
             nn.Linear(latent_dim, 64),
             nn.LeakyReLU(0.1),
         )
+        """
         self.dec2 = nn.Sequential(
             nn.Linear(64, 32),
             nn.LeakyReLU(0.1),
@@ -341,11 +342,24 @@ class DecoderTheta(nn.Module):
             nn.LeakyReLU(0.1),
         )   # Jₑ = ∂f/∂z is computed through these two layers
         """
-        self.dec4_head_3 = nn.Sequential(
+        self.tower_a = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.LeakyReLU(0.1),
+            nn.Linear(32, 16),
+            nn.LeakyReLU(0.1),
             nn.Linear(16, 8),
             nn.LeakyReLU(0.1),
-        )   # Jₑ = ∂f/∂z is computed through these two layers
-        """
+        )
+
+        # ── TOWER B: Dedicated strictly to Uncertainty (b_t) ──
+        self.tower_b = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.LeakyReLU(0.1),
+            nn.Linear(32, 16),
+            nn.LeakyReLU(0.1),
+            nn.Linear(16, 8),
+            nn.LeakyReLU(0.1),
+        )
         # ── Per-segment output heads
         # a head: identity activation → committed ETA
         """self.heads_a = nn.ModuleList([nn.Linear(4, 1)
@@ -357,23 +371,19 @@ class DecoderTheta(nn.Module):
         self.heads_b = nn.Linear(8, 1)
         #self.heads_c = nn.Linear(8, 1)
         
+        
         nn.init.xavier_uniform_(self.heads_a.weight, gain=1.0)
-        """
-        nn.init.xavier_uniform_(self.heads_b.weight, gain=0.1)
-        """
+        #nn.init.xavier_uniform_(self.heads_a.weight, gain=0.5)
+        
         nn.init.xavier_uniform_(self.heads_b.weight, gain=1.5)
+        
+        #nn.init.xavier_uniform_(self.heads_b.weight, gain=3.0)
         # 1.0 escapes the Student-T Trap, telling the network the data is valid signal, not outliers!
-        """
+        
         nn.init.constant_(self.heads_b.bias, 1.0)
-        """
-        nn.init.constant_(self.heads_b.bias, 0.0)
+        
+        #nn.init.constant_(self.heads_b.bias, 0.0)
 
-    def _trunk(self, z):
-        """Forward through dec1 → dec2, return intermediate feature."""
-        h1 = self.dec1(z)    # [B, 32]
-        h2 = self.dec2(h1)   # [B, 16]
-        h3 = self.dec3(h2)   # [B, 16]
-        return h3
 
     
     def forward_with_epistemic(self, z, sigma, mu):
@@ -382,7 +392,13 @@ class DecoderTheta(nn.Module):
         Pyro's weight posterior via Predictive(num_samples=50) handles
         epistemic uncertainty at inference time.
         """
-        h = self._trunk(z)              # [B, 16]  — one pass
+        initial_h = self.dec1(z)
+        h_a = self.tower_a(initial_h)
+        a_e = self.heads_a(h_a)
+        h_b = self.tower_b(initial_h)
+        b_e = self.heads_b(h_b)
+        b_t = torch.exp(0.5 * torch.clamp(b_e, min=-10.0, max=10.0)) + 1e-3
+        """
         h_a = self.dec4_head_1(h)       # [B, 8]
         h_b = self.dec4_head_2(h)       # [B, 8]
         #h_c = self.dec4_head_3(h)       # [B, 8]
@@ -390,6 +406,8 @@ class DecoderTheta(nn.Module):
         a_e = self.heads_a(h_a)                                    # loc
         b_t = torch.nn.functional.softplus(self.heads_b(h_b)) + 1e-3  # scale
         #df_t = torch.nn.functional.softplus(self.heads_c(h_c)) + 7.0  # scale
+        
+        """
         outputs = (a_e, b_t)
         return outputs
 
@@ -566,7 +584,7 @@ if __name__ == "__main__":
     CYCLE_LENGTH = 1000
     optimizer_args = {
         "optimizer": torch.optim.AdamW,
-        "optim_args": {"lr": 0.001, "weight_decay": 0.20},
+        "optim_args": {"lr": 0.001, "weight_decay": 0.01},
     }
 
     def scheduler_constructor(optim):
@@ -587,7 +605,7 @@ if __name__ == "__main__":
 
     ramp_epochs = 500
     down_epoch  = 1000
-    max_beta    = 0.5 # 0.8
+    max_beta    = 0.8 # 0.8
 
     for epoch in range(epochs):
         epoch_loss = epoch_ll = epoch_kl = 0.0
@@ -618,7 +636,7 @@ if __name__ == "__main__":
             print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {ll:.2f} | KL: {kl:.2f}")
 
     #pyro.get_param_store().save("ghost_bus_vae_aggregate.pt")
-    torch.save(bnn_model.state_dict(), "ghost_bus_vae_aggregate_0.5_high_gain.pt")
+    torch.save(bnn_model.state_dict(), "ghost_bus_vae_aggregate_0.8.pt")
     joblib.dump(scaler_y, "y_scaler_vae_aggregate.pkl")
     print("\nModel weights and scaler saved successfully.")
 
