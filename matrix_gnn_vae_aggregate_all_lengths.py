@@ -592,7 +592,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_all_length.csv" 
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_new_all_length.csv" 
     x_global_all, x_local_all, y_all, seg_mask_all, scaler_y = process_raw_data(file_path)  
 
     idx = np.arange(x_global_all.shape[0])
