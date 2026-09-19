@@ -353,35 +353,36 @@ class DecoderTheta(nn.Module):
                                       for _ in range(num_segments)])
                                       """
         
-        self.heads_a = nn.Linear(8, 1)
-        # b head: softplus → √Vₐ (aleatoric)
-        self.heads_b = nn.Linear(8, 1)
-        #self.heads_c = nn.Linear(8, 1)
-        
+        self.heads_a = nn.Linear(8, 1)  # loc
+        self.heads_b = nn.Linear(8, 1)  # scale
+        self.heads_df = nn.Linear(8, 1) # 【新增】df 頭
         
         nn.init.xavier_uniform_(self.heads_a.weight, gain=1.0)
-        #nn.init.xavier_uniform_(self.heads_a.weight, gain=0.5)
-        
         nn.init.xavier_uniform_(self.heads_b.weight, gain=1.5)
-        
-        #nn.init.xavier_uniform_(self.heads_b.weight, gain=3.0)
-        # 1.0 escapes the Student-T Trap, telling the network the data is valid signal, not outliers!
-        
         nn.init.constant_(self.heads_b.bias, 1.0)
         
-        #nn.init.constant_(self.heads_b.bias, 0.0)
+        # 【新增】df 頭的初始化：初始 bias 設為 2.0，讓初始 nu 約在 10 左右（接近高斯，利於穩定起步）
+        nn.init.xavier_uniform_(self.heads_df.weight, gain=0.1)
+        nn.init.constant_(self.heads_df.bias, 2.0)
 
 
     
     def forward(self, z, x_global):  # Changed from forward_with_epistemic(self, z, sigma, mu)
         dec_in = torch.cat([z, x_global], dim=-1)
         initial_h = self.dec1(dec_in)
+        
         h_a = self.tower_a(initial_h)
         a_e = self.heads_a(h_a)
+        
         h_b = self.tower_b(initial_h)
         b_e = self.heads_b(h_b)
         b_t = torch.exp(0.5 * torch.clamp(b_e, min=-10.0, max=10.0)) + 1e-3
-        return (a_e, b_t)
+        
+        # 【新增】動態計算每個 trip 的 df（自由度）
+        df_e = self.heads_df(h_b)
+        nu = torch.nn.functional.softplus(df_e) + 2.05  # 保證 nu > 2，避免方差發散
+        
+        return (a_e, b_t, nu)
 
 
 # ==========================================
@@ -436,13 +437,11 @@ class MatrixGNN_VAE(nn.Module):
         kl = kl_gaussian_to_standard_normal(mu, logvar)
 
         # ── DECODER (THIS IS THE FIX! Use self.decoder(z) directly)
-        outputs = self.decoder(z, global_features)
-        
-        locs, scalers = outputs
+        locs, scalers, dfs = self.decoder(z, global_features)
         
         if return_attn:
-            return locs, scalers, kl, attn_weights   
-        return locs, scalers, kl
+            return locs, scalers, dfs, kl, attn_weights   
+        return locs, scalers, dfs, kl
 
 
 # ==========================================
@@ -470,27 +469,27 @@ def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
         pyro.sample(f"obs_full_trip", dist_i, obs=target)
 """
 def model_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
-    # Register the decoder's parameters with Pyro
     pyro.module("decoder", bnn_model.decoder) 
     
     if total_size is None:
         total_size = x_global.shape[0]
         
     with pyro.plate("data", size=total_size, subsample_size=x_global.shape[0]):
-        # 1. Prior for latent space (Standard Normal N(0, I))
         z_prior_mu = x_global.new_zeros(x_global.shape[0], bnn_model.latent_dim)
         z_prior_sigma = x_global.new_ones(x_global.shape[0], bnn_model.latent_dim)
         
-        # Scale KL by wrapping the prior sample
         with pyro.poutine.scale(scale=kl_weight):
-            # .to_event(1) tells Pyro these 64 dimensions belong to ONE latent vector
             z = pyro.sample("latent_z", dist.Normal(z_prior_mu, z_prior_sigma).to_event(1))
         
-        # 2. Decode Z into ETA (a_e) and Uncertainty (b_t)
-        a_e, b_t = bnn_model.decoder(z, x_global)
+        # 取得 a_e, b_t, df
+        a_e, b_t, df = bnn_model.decoder(z, x_global)
         
-        # 3. Compute Likelihood of the actual data
-        pyro.sample("obs", dist.Normal(a_e.squeeze(-1), b_t.squeeze(-1)), obs=y_true)
+        # 【修改】使用 StudentT 似然分佈！
+        pyro.sample(
+            "obs", 
+            dist.StudentT(df.squeeze(-1), a_e.squeeze(-1), b_t.squeeze(-1)), 
+            obs=y_true
+        )
 
 def guide_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
     # Register the encoder's parameters with Pyro
@@ -515,15 +514,15 @@ def guide_fn(x_global, x_local, y_true=None, total_size=None, kl_weight=1.0):
 
 def get_ll_kl(model_fn, guide_fn, x_g, x_l, y, total_size):
     with torch.no_grad():
-        locs, scales, kl = bnn_model(x_g, x_l)   # 4-tuple now
+        locs, scales, dfs, kl = bnn_model(x_g, x_l)
         loc   = locs.squeeze(-1)
         scale = scales.squeeze(-1)
-        #df    = dfs.squeeze(-1)
+        df    = dfs.squeeze(-1)
 
-        d  = torch.distributions.Normal(loc=loc, scale=scale)
+        # 改用 StudentT 計算 Log Likelihood
+        d  = torch.distributions.StudentT(df=df, loc=loc, scale=scale)
         ll = d.log_prob(y[:]).sum().item()
         kl = kl.mean().item()
-        # kl already returned from forward(), no need to re-run encoder
     return ll, kl
 
 
@@ -540,7 +539,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_Jan_Jun.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_Jul_Dec.xlsx"
     x_global_all, x_local_all, y_all, scaler_y, y_raw = process_raw_data(file_path)
 
     idx = np.arange(x_global_all.shape[0])
@@ -624,8 +623,8 @@ if __name__ == "__main__":
             print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {ll:.2f} | KL: {kl:.2f}")
 
     #pyro.get_param_store().save("ghost_bus_vae_aggregate.pt")
-    torch.save(bnn_model.state_dict(), "2025_Jul_Dec_vae_ft_normal_TTC_927.pt")
-    joblib.dump(scaler_y, "y_scaler_vae_normal_2025_Jul_Dec_TTC_927.pkl")
+    torch.save(bnn_model.state_dict(), "2025_Jul_Dec_vae_ft_student_t_TTC_927.pt")
+    joblib.dump(scaler_y, "y_scaler_vae_student_t_2025_Jul_Dec_TTC_927.pkl")
     print("\nModel weights and scaler saved successfully.")
 
     # ==========================================
@@ -640,19 +639,22 @@ if __name__ == "__main__":
             sigma = torch.exp(0.5 * logvar)                       
 
             for _ in range(n_samples):
-                eps    = torch.randn_like(mu) 
-                z    = mu + eps * sigma
+                eps = torch.randn_like(mu) 
+                z   = mu + eps * sigma
 
-                a_e, b_t = bnn_model.decoder(z, x_global)
+                # 取得動態學到的 a_e, b_t, df
+                a_e, b_t, df = bnn_model.decoder(z, x_global)
 
-                obs_dist = torch.distributions.Normal(
+                # 從 StudentT 取樣
+                obs_dist = torch.distributions.StudentT(
+                    df=df.squeeze(-1),
                     loc=a_e.squeeze(-1),
                     scale=b_t.squeeze(-1),
                 )
                 all_samples.append(obs_dist.sample()) 
                 
-        bnn_model.eval() # Turn dropout back off        
-        return torch.stack(all_samples, dim=0) # [MC_SAMPLES, BATCH_SIZE]
+        bnn_model.eval()        
+        return torch.stack(all_samples, dim=0)
 
     list_of_predict = []
     list_of_actual  = []
