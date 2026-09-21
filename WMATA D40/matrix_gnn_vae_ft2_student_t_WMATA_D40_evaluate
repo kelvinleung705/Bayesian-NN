@@ -1,0 +1,466 @@
+import argparse
+import time
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    mean_squared_error,
+)
+import torch
+import torch.nn as nn
+
+# =========================================================================
+# 建議做法：直接從訓練腳本引入模型定義（請確認檔名對齊，例如 train_model.py）
+# from train_model import MatrixGNN_VAE, NUM_SEGMENT, LATENT_DIM
+# 這裡先保留修正過、與訓練代碼 100% 完全一致的模型結構以供直接運行：
+# =========================================================================
+
+NUM_SEGMENT = 13
+GLOBAL_DIM = 9
+LOCAL_DIM = 4
+HIDDEN_DIM = 64
+LATENT_DIM = 64
+MC_SAMPLES = 200
+INFER_BATCH = 512
+
+PARAMS_PATH = "2024_Jul_Dec_vae_ft_student_t_0.6_WMATA_D40.pt"
+SCALER_PATH = "y_scaler_vae_student_t_2024_Jul_Dec_WMATA_D40.pkl"
+DATA_PATH = "D40_2025_1-6.csv"
+
+
+class LocalIsolationLayer(nn.Module):
+
+    def __init__(self, input_dim, output_dim, num_segments):
+        super().__init__()
+        self.num_segments = num_segments
+        self.nets = nn.ModuleList(
+            [nn.Linear(input_dim, output_dim) for _ in range(num_segments)]
+        )
+
+    def forward(self, x_inputs):
+        return [
+            torch.nn.functional.silu(self.nets[i](x_inputs[i]))
+            for i in range(self.num_segments)
+        ]
+
+
+class NeighborMixingLayer(nn.Module):
+
+    def __init__(self, input_dim, output_dim, num_segments, dropout_rate=0.2):
+        super().__init__()
+        self.num_segments = num_segments
+        net_in = input_dim * 2
+
+        self.w_self = nn.Parameter(torch.full((num_segments,), 1.0))
+        self.w_right = nn.Parameter(torch.full((num_segments,), 0.0))
+
+        self.nets_1 = nn.ModuleList(
+            [nn.Linear(net_in, output_dim) for _ in range(num_segments)]
+        )
+        self.nets_2 = nn.ModuleList(
+            [nn.Linear(output_dim, output_dim) for _ in range(num_segments)]
+        )
+
+        self.dropout_1 = nn.Dropout(p=dropout_rate)
+        self.dropout_2 = nn.Dropout(p=dropout_rate)
+
+    def forward(self, prev):
+        out = []
+        for i in range(self.num_segments):
+            ws = torch.nn.functional.softplus(self.w_self[i])
+            wr = torch.nn.functional.softplus(self.w_right[i])
+            self_feat = prev[i] * ws
+            right_feat = (
+                prev[i + 1] * wr
+                if i < self.num_segments - 1
+                else torch.zeros_like(self_feat)
+            )
+
+            h = torch.cat([self_feat, right_feat], dim=1)
+            h = self.dropout_1(self.nets_1[i](h))
+            h = torch.nn.functional.silu(h)
+            h = self.dropout_2(self.nets_2[i](h))
+            h = torch.nn.functional.silu(h)
+            out.append(h)
+        return out
+
+
+class AttentionPooling(nn.Module):
+
+    def __init__(
+        self, hidden_dim: int, out_dim: int = None, dropout: float = 0.1
+    ):
+        super().__init__()
+        self.out_dim = out_dim if out_dim is not None else hidden_dim
+        self.gate = nn.Linear(hidden_dim, 1, bias=True)
+        self.v_proj = nn.Linear(hidden_dim, self.out_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, h_stack: torch.Tensor, return_weights: bool = False):
+        scores = self.gate(h_stack).squeeze(-1)
+        weights = torch.softmax(scores, dim=1)
+        weights = self.dropout(weights)
+        v = self.v_proj(h_stack)
+        pooled = (weights.unsqueeze(-1) * v).sum(dim=1)
+        if return_weights:
+            return pooled, weights
+        return pooled
+
+
+class EncoderPhi(nn.Module):
+
+    def __init__(
+        self, global_dim, local_dim, hidden_dim, num_segments, latent_dim
+    ):
+        super().__init__()
+        self.head_dropout = nn.Dropout(p=0.1)
+        self.num_segments = num_segments
+        self.latent_dim = latent_dim
+        input_dim = global_dim + local_dim
+
+        self.embedding_layer = LocalIsolationLayer(
+            input_dim, hidden_dim, num_segments
+        )
+        self.prop_layers = nn.ModuleList(
+            [
+                NeighborMixingLayer(
+                    hidden_dim, hidden_dim, num_segments, dropout_rate=0.2
+                )
+                for _ in range(2)
+            ]
+        )
+        self.attn_pool = AttentionPooling(hidden_dim, hidden_dim, dropout=0.1)
+        self.head_mu = nn.Linear(hidden_dim, latent_dim)
+        self.head_logvar = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(
+        self, global_features, all_sections_data, return_attn: bool = False
+    ):
+        inputs_list = []
+        for i in range(self.num_segments):
+            loc_i = all_sections_data[:, i, :]
+            inputs_list.append(torch.cat([global_features, loc_i], dim=1))
+
+        h = self.embedding_layer(inputs_list)
+        for layer in self.prop_layers:
+            h = layer(h)
+
+        h_stack = torch.stack(h, dim=1)
+        if return_attn:
+            h_pool, attn_weights = self.attn_pool(h_stack, return_weights=True)
+        else:
+            h_pool = self.attn_pool(h_stack)
+
+        h_pool = self.head_dropout(h_pool)
+        mu = self.head_mu(h_pool)
+        logvar = self.head_logvar(h_pool)
+        logvar = torch.clamp(logvar, min=-8.0, max=8.0)
+
+        if return_attn:
+            return mu, logvar, attn_weights
+        return mu, logvar
+
+
+class DecoderTheta(nn.Module):
+
+    def __init__(self, latent_dim, num_segments, global_dim=9):
+        super().__init__()
+        self.num_segments = num_segments
+        self.latent_dim = latent_dim
+        self.drop = nn.Dropout(0.1)
+
+        self.dec1 = nn.Sequential(
+            nn.Linear(latent_dim + global_dim, 64),
+            nn.LayerNorm(64),
+            nn.LeakyReLU(0.1),
+            self.drop,
+        )
+        self.tower_a = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.LeakyReLU(0.1),
+            self.drop,
+            nn.Linear(32, 16),
+            nn.LeakyReLU(0.1),
+            nn.Linear(16, 8),
+            nn.LeakyReLU(0.1),
+        )
+        self.tower_b = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.LeakyReLU(0.1),
+            self.drop,
+            nn.Linear(32, 16),
+            nn.LeakyReLU(0.1),
+            nn.Linear(16, 8),
+            nn.LeakyReLU(0.1),
+        )
+
+        self.heads_a = nn.Linear(8, 1)
+        self.heads_b = nn.Linear(8, 1)
+        self.heads_df = nn.Linear(8, 1)
+
+    def forward(self, z, x_global):
+        dec_in = torch.cat([z, x_global], dim=-1)
+        initial_h = self.dec1(dec_in)
+
+        h_a = self.tower_a(initial_h)
+        a_e = self.heads_a(h_a)
+
+        h_b = self.tower_b(initial_h)
+        b_e = self.heads_b(h_b)
+
+        # 【修正點 1】與訓練代碼完全對齊的 clamp 邊界
+        b_t = torch.exp(0.5 * torch.clamp(b_e, min=-6.0, max=4.0)) + 1e-3
+
+        # 【修正點 2】與訓練代碼完全對齊的 +2.5 與 [2.5, 30.0] clamp
+        df_e = self.heads_df(h_b)
+        nu = torch.clamp(
+            torch.nn.functional.softplus(df_e) + 2.5, min=2.5, max=30.0
+        )
+        return a_e, b_t, nu
+
+
+class MatrixGNN_VAE(nn.Module):
+
+    def __init__(
+        self,
+        num_sections=NUM_SEGMENT,
+        global_dim=GLOBAL_DIM,
+        local_dim=LOCAL_DIM,
+        hidden_dim=HIDDEN_DIM,
+        latent_dim=LATENT_DIM,
+    ):
+        super().__init__()
+        self.encoder = EncoderPhi(
+            global_dim, local_dim, hidden_dim, num_sections, latent_dim
+        )
+        self.decoder = DecoderTheta(
+            latent_dim, num_sections, global_dim=global_dim
+        )
+
+    def forward(self, global_features, all_sections_data, force_sample=False):
+        mu, logvar = self.encoder(global_features, all_sections_data)
+        sigma = torch.exp(0.5 * logvar)
+
+        if force_sample:
+            eps = torch.randn_like(mu)
+            z = mu + eps * sigma
+        else:
+            z = mu
+
+        locs, scalers, dfs = self.decoder(z, global_features)
+        return locs, scalers, dfs
+
+
+# ==========================================
+# 資料讀取與載入
+# ==========================================
+def load_eval_data_with_raw_y(file_path):
+    print(f"正在讀取評估資料: {file_path}...")
+    df = pd.read_csv(file_path, header=None, skiprows=1)
+
+    end = 9 + NUM_SEGMENT + 1 + (NUM_SEGMENT * 4) + 2
+    df_subset = df.iloc[:, 0:end].apply(pd.to_numeric, errors="coerce")
+
+    # 確保完全去除含 NaN 的列
+    df_subset = df_subset.dropna()
+
+    raw_data_np = df_subset.values.astype(np.float32)
+    x_global = torch.tensor(raw_data_np[:, 0:9], dtype=torch.float32)
+    raw_local = raw_data_np[
+        :, 9 + NUM_SEGMENT + 1 : 9 + NUM_SEGMENT + 1 + (NUM_SEGMENT * 4)
+    ]
+    x_local = torch.tensor(
+        raw_local.reshape(-1, NUM_SEGMENT, 4), dtype=torch.float32
+    )
+
+    y_raw = raw_data_np[:, 9 : 9 + NUM_SEGMENT].sum(axis=1)
+
+    # 【修正點 3】過濾目標值中潛在的 NaN 或 Inf
+    valid_idx = np.isfinite(y_raw)
+    if not np.all(valid_idx):
+        print(f"⚠️ 警告: 移除包含 NaN/Inf 的標籤 {np.sum(~valid_idx)} 筆")
+        x_global = x_global[valid_idx]
+        x_local = x_local[valid_idx]
+        y_raw = y_raw[valid_idx]
+
+    print(
+        f"加載筆數: {x_global.shape[0]} | y_raw 平均值: {y_raw.mean():.2f}s | y_raw 標準差: {y_raw.std():.2f}s"
+    )
+    return x_global, x_local, y_raw
+
+
+def load_model(params_path, device):
+    bnn_model = MatrixGNN_VAE().to(device)
+    state_dict = torch.load(params_path, map_location=device)
+    bnn_model.load_state_dict(state_dict)
+    bnn_model.eval()
+    return bnn_model
+
+
+# ==========================================
+# 批次推論
+# ==========================================
+def run_inference_fast(
+    x_global_val,
+    x_local_val,
+    y_raw,
+    bnn_model,
+    scaler_y,
+    device,
+    mc_samples=200,
+    batch_size=512,
+    use_mc_dropout=False,
+):
+    n = x_global_val.shape[0]
+
+    pred_means = np.zeros(n, dtype=np.float32)
+    pred_stds = np.zeros(n, dtype=np.float32)
+    pred_dfs = np.zeros(n, dtype=np.float32)
+
+    print(
+        f"\n開始執行批次推論 (總樣本數={n}, MC取樣數={mc_samples}, 批次大小={batch_size})..."
+    )
+    t0 = time.time()
+
+    bnn_model.eval()
+    if use_mc_dropout:
+        for m in bnn_model.modules():
+            if m.__class__.__name__.startswith("Dropout"):
+                m.train()
+
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch_g = x_global_val[start:end]
+            batch_l = x_local_val[start:end]
+
+            mc_locs = []
+            mc_scales = []
+            mc_dfs = []
+
+            for _ in range(mc_samples):
+                loc, scale, df = bnn_model(batch_g, batch_l, force_sample=True)
+                mc_locs.append(loc.squeeze(-1))
+                mc_scales.append(scale.squeeze(-1))
+                mc_dfs.append(df.squeeze(-1))
+
+            mc_locs = torch.stack(mc_locs)  # [MC, Batch]
+            mc_scales = torch.stack(mc_scales)  # [MC, Batch]
+            mc_dfs = torch.stack(mc_dfs)  # [MC, Batch]
+
+            # 1. 預測期望值
+            final_eta = mc_locs.mean(dim=0)
+
+            # 2. Epistemic 不確定性
+            epistemic_var = mc_locs.var(dim=0, unbiased=False)
+
+            # 3. Student-t Aleatoric 不確定性
+            # Var = scale^2 * (nu / (nu - 2.0))
+            # 【修正點 4】加入 clamp 保護，防止分母接近 0
+            safe_denom = torch.clamp(mc_dfs - 2.0, min=0.1)
+            student_t_sample_vars = (mc_scales**2) * (mc_dfs / safe_denom)
+            aleatoric_var = student_t_sample_vars.mean(dim=0)
+
+            total_std = torch.sqrt(epistemic_var + aleatoric_var + 1e-6)
+
+            pred_means[start:end] = final_eta.cpu().numpy()
+            pred_stds[start:end] = total_std.cpu().numpy()
+            pred_dfs[start:end] = mc_dfs.mean(dim=0).cpu().numpy()
+
+            elapsed = time.time() - t0
+            rate = end / elapsed if elapsed > 0 else 0
+            print(
+                f"  進度: {end:5d}/{n}  |  速度: {rate:.0f} trips/s",
+                end="\r",
+                flush=True,
+            )
+
+    elapsed = time.time() - t0
+    print(f"\n推論完成！總耗時: {elapsed:.2f}s")
+
+    # 反標準化
+    pred_real = scaler_y.inverse_transform(pred_means.reshape(-1, 1)).squeeze(
+        -1
+    )
+    std_real = pred_stds * scaler_y.scale_[0]
+    actual_real = y_raw
+
+    # 【修正點 5】雙重檢查確保無 NaN
+    nan_mask = (
+        np.isnan(pred_real)
+        | np.isnan(actual_real)
+        | np.isinf(pred_real)
+        | np.isinf(actual_real)
+    )
+    if np.any(nan_mask):
+        print(f"⚠️ 發現 {np.sum(nan_mask)} 筆 NaN/Inf，自動過濾以供計算指標")
+        pred_real = pred_real[~nan_mask]
+        actual_real = actual_real[~nan_mask]
+        std_real = std_real[~nan_mask]
+        pred_dfs = pred_dfs[~nan_mask]
+        n = len(pred_real)
+
+    _print_results(pred_real, actual_real, std_real, pred_dfs, n, mc_samples)
+
+
+def _print_results(pred_real, actual_real, std_real, pred_dfs, n, mc_samples):
+    trip_within = (actual_real >= pred_real - std_real) & (
+        actual_real <= pred_real + std_real
+    )
+    num_samples_to_show = min(n, 5)
+
+    print("\n" + "=" * 70)
+    print(f"  前 {num_samples_to_show} 筆個別推論抽樣展示")
+    print("=" * 70)
+    for j in range(num_samples_to_show):
+        print(f"--- 樣本 {j+1} ---")
+        print(f"  預測 ETA    : {pred_real[j]:.1f}s (真實值: {actual_real[j]:.1f}s)")
+        print(
+            f"  信賴區間    : ±{std_real[j]:.1f}s | 落在區間內? {'YES' if trip_within[j] else 'NO'}"
+        )
+        print(f"  動態自由度  : ν = {pred_dfs[j]:.2f}")
+
+    mae = mean_absolute_error(actual_real, pred_real)
+    mape = mean_absolute_percentage_error(actual_real, pred_real) * 100
+    rmse = np.sqrt(mean_squared_error(actual_real, pred_real))
+    bias = (pred_real - actual_real).mean()
+    cov = trip_within.mean() * 100
+
+    print("\n" + "=" * 70)
+    print(f"SUMMARY REPORT  ({n} trips | {mc_samples} MC samples | Student-t)")
+    print("=" * 70)
+    print(f"  信賴區間覆蓋率 (Within CI) : {cov:.2f}% [目標: 68.3%]")
+    print(f"  平均學到的尾部自由度 (ν)   : {np.mean(pred_dfs):.2f}")
+    print(f"  平均絕對誤差 (MAE)         : {mae:.2f} s")
+    print(f"  平均絕對百分比誤差 (MAPE)  : {mape:.2f} %")
+    print(f"  均方根誤差 (RMSE)          : {rmse:.2f} s")
+    print(f"  整體預測偏差 (Bias)        : {bias:.2f} s")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"執行硬體裝置: {device}")
+
+    scaler_y = joblib.load(SCALER_PATH)
+    x_global_all, x_local_all, y_raw = load_eval_data_with_raw_y(DATA_PATH)
+
+    x_global_val = x_global_all.to(device)
+    x_local_val = x_local_all.to(device)
+
+    model = load_model(PARAMS_PATH, device)
+
+    # 預設將 use_mc_dropout 關閉，讓推論完全專注在 VAE 潛在空間的蒙地卡羅取樣
+    run_inference_fast(
+        x_global_val,
+        x_local_val,
+        y_raw,
+        model,
+        scaler_y,
+        device,
+        mc_samples=MC_SAMPLES,
+        batch_size=INFER_BATCH,
+        use_mc_dropout=False,
+    )

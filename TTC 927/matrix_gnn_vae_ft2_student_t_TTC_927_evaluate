@@ -10,9 +10,9 @@ from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error,
 # ==========================================
 # 1. 預設超參數與檔案路徑
 # ==========================================
-PARAMS_PATH  = "2024_Jan_Jun_vae_ft_student_t_WMATA_D40.pt"
-SCALER_PATH  = "y_scaler_vae_student_t_2024_Jan_Jun_WMATA_D40.pkl"
-DATA_PATH    = "D60_2024_7-12.csv"
+PARAMS_PATH  = "2025_Jan_Jun_vae_ft_student_t_0.7_TTC_927.pt"
+SCALER_PATH  = "y_scaler_vae_student_t_2025_Jan_Jun_TTC_927.pkl"
+DATA_PATH    = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_Jul_Dec.xlsx"
 
 NUM_SEGMENT  = 9
 GLOBAL_DIM   = 9
