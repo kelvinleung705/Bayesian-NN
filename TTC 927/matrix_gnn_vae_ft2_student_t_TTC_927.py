@@ -539,7 +539,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_Jan_Jun.xlsx"
+    file_path = "trip_info_9_section_ver2_simplify_ultra_no_variance_2024_Jul_Dec.xlsx"
     x_global_all, x_local_all, y_all, scaler_y, y_raw = process_raw_data(file_path)
 
     idx = np.arange(x_global_all.shape[0])
@@ -592,7 +592,7 @@ if __name__ == "__main__":
 
     ramp_epochs = 500
     down_epoch  = 1000
-    max_beta    = 0.7 # 0.6
+    max_beta    = 0.7
 
     for epoch in range(epochs):
         epoch_loss = epoch_ll = epoch_kl = 0.0
@@ -623,8 +623,8 @@ if __name__ == "__main__":
             print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {ll:.2f} | KL: {kl:.2f}")
 
     #pyro.get_param_store().save("ghost_bus_vae_aggregate.pt")
-    torch.save(bnn_model.state_dict(), "2025_Jan_Jul_vae_ft_student_t_0.7_TTC_927.pt")
-    joblib.dump(scaler_y, "y_scaler_vae_student_t_0.7_2025_Jan_Jun_TTC_927.pkl")
+    torch.save(bnn_model.state_dict(), "2024_Jul_Dec_vae_ft_student_t_0.6_TTC_927.pt")
+    joblib.dump(scaler_y, "y_scaler_vae_student_t_0.6_2024_Jul_Dec_TTC_927.pkl")
     print("\nModel weights and scaler saved successfully.")
 
     # ==========================================

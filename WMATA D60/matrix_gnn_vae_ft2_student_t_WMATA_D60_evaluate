@@ -17,7 +17,7 @@ import torch.nn as nn
 # 這裡先保留修正過、與訓練代碼 100% 完全一致的模型結構以供直接運行：
 # =========================================================================
 
-NUM_SEGMENT = 13
+NUM_SEGMENT = 10
 GLOBAL_DIM = 9
 LOCAL_DIM = 4
 HIDDEN_DIM = 64
@@ -25,9 +25,9 @@ LATENT_DIM = 64
 MC_SAMPLES = 200
 INFER_BATCH = 512
 
-PARAMS_PATH = "2024_Jul_Dec_vae_ft_student_t_0.6_WMATA_D40.pt"
-SCALER_PATH = "y_scaler_vae_student_t_2024_Jul_Dec_WMATA_D40.pkl"
-DATA_PATH = "D40_2025_1-6.csv"
+PARAMS_PATH = "2024_Jul_Dec_vae_ft_student_t_0.6_WMATA_D60.pt"
+SCALER_PATH = "y_scaler_vae_student_t_2024_Jul_Dec_WMATA_D60.pkl"
+DATA_PATH = "D60_2025_1-6.csv"
 
 
 class LocalIsolationLayer(nn.Module):

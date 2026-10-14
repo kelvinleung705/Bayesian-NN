@@ -17,7 +17,7 @@ from sklearn.model_selection import train_test_split
 from pyro.optim import ExponentialLR
 import joblib
 
-num_segment = 13
+num_segment = 10
 LATENT_DIM = 64   # z ∈ ℝ³²
 
 # ==========================================
@@ -537,25 +537,204 @@ def get_ll_kl(model_fn, guide_fn, x_g, x_l, y, total_size):
 # ==========================================
 # 8.  TRAINING & 9. AGGREGATE INFERENCE
 # ==========================================
+def evaluate_metrics(model, val_loader, scaler_y, device, n_samples=50):
+    """
+    Evaluates the model on validation data across MC samples.
+    Calculates RMSE, MAE, and MAPE on the real-world scale (unscaled seconds).
+    """
+    model.eval()
+    all_preds = []
+    all_actuals = []
+
+    with torch.no_grad():
+        for x_g_b, x_l_b, y_b in val_loader:
+            x_g_b = x_g_b.to(device)
+            x_l_b = x_l_b.to(device)
+
+            mu, logvar = model.encoder(x_g_b, x_l_b)
+            sigma = torch.exp(0.5 * logvar)
+
+            # MC sampling over the batch
+            batch_samples = []
+            for _ in range(n_samples):
+                eps = torch.randn_like(mu)
+                z = mu + eps * sigma
+                a_e, b_t, df = model.decoder(z, x_g_b)
+                obs_dist = torch.distributions.StudentT(
+                    df=df.squeeze(-1),
+                    loc=a_e.squeeze(-1),
+                    scale=b_t.squeeze(-1)
+                )
+                batch_samples.append(obs_dist.sample())
+
+            # Mean across samples -> [B]
+            pred_scaled_batch = torch.stack(batch_samples, dim=0).mean(dim=0).cpu().numpy()
+            y_actual_batch = y_b.numpy()
+
+            all_preds.extend(pred_scaled_batch)
+            all_actuals.extend(y_actual_batch)
+
+    model.train()
+
+    preds_scaled = np.array(all_preds).reshape(-1, 1)
+    actuals_scaled = np.array(all_actuals).reshape(-1, 1)
+
+    # Invert back to seconds
+    preds_real = scaler_y.inverse_transform(preds_scaled).ravel()
+    actuals_real = scaler_y.inverse_transform(actuals_scaled).ravel()
+
+    # Calculate metrics
+    mae = np.mean(np.abs(actuals_real - preds_real))
+    rmse = np.sqrt(np.mean((actuals_real - preds_real) ** 2))
+    # Epsilon prevents divide-by-zero
+    mape = np.mean(np.abs((actuals_real - preds_real) / np.clip(np.abs(actuals_real), 1e-6, None))) * 100.0
+
+    return rmse, mae, mape
+
+
+def train_single_run(
+    run_id,
+    train_file,
+    val_file,
+    output_dir,
+    epochs=4000,
+    batch_size=734,
+    device_name="cuda",
+):
+    """
+    Trains a single model instance and logs validation metrics to a dedicated folder.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    device = torch.device(device_name if torch.cuda.is_available() else "cpu")
+    print(f"[{run_id}] Running on device: {device}")
+
+    # 1. Load Data
+    x_g_train, x_l_train, y_train, scaler_y, _ = process_raw_data(train_file)
+
+    if os.path.exists(val_file):
+        x_g_val, x_l_val, y_val, _, _ = process_raw_data(val_file, scaler_y=scaler_y)
+    else:
+        print(f"[{run_id}] Validation file not found. Performing 90/10 split...")
+        idx = np.arange(x_g_train.shape[0])
+        t_idx, v_idx = train_test_split(idx, test_size=0.1, random_state=42)
+        x_g_val, x_l_val, y_val = x_g_train[v_idx], x_l_train[v_idx], y_train[v_idx]
+        x_g_train, x_l_train, y_train = x_g_train[t_idx], x_l_train[t_idx], y_train[t_idx]
+
+    train_loader = DataLoader(TensorDataset(x_g_train, x_l_train, y_train), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(x_g_val, x_l_val, y_val), batch_size=256, shuffle=False)
+
+    # 2. Build Model (Isolate parameter store per process)
+    pyro.clear_param_store()
+    model = MatrixGNN_VAE(
+        num_sections=num_segment,
+        global_dim=9,
+        local_dim=4,
+        hidden_dim=64,
+        latent_dim=LATENT_DIM,
+        device=device,
+    ).to(device)
+
+    # 3. Setup Closures for Pyro
+    def local_model_fn(x_g, x_l, y=None, total_size=None, kl_weight=1.0):
+        pyro.module(f"decoder_{run_id}", model.decoder)
+        if total_size is None:
+            total_size = x_g.shape[0]
+        with pyro.plate(f"data_{run_id}", size=total_size, subsample_size=x_g.shape[0]):
+            z_mu = x_g.new_zeros(x_g.shape[0], model.latent_dim)
+            z_sigma = x_g.new_ones(x_g.shape[0], model.latent_dim)
+            with pyro.poutine.scale(scale=kl_weight):
+                z = pyro.sample("latent_z", dist.Normal(z_mu, z_sigma).to_event(1))
+            a_e, b_t, df = model.decoder(z, x_g)
+            pyro.sample("obs", dist.StudentT(df.squeeze(-1), a_e.squeeze(-1), b_t.squeeze(-1)), obs=y)
+
+    def local_guide_fn(x_g, x_l, y=None, total_size=None, kl_weight=1.0):
+        pyro.module(f"encoder_{run_id}", model.encoder)
+        if total_size is None:
+            total_size = x_g.shape[0]
+        with pyro.plate(f"data_{run_id}", size=total_size, subsample_size=x_g.shape[0]):
+            mu, logvar = model.encoder(x_g, x_l)
+            sigma = torch.exp(0.5 * logvar)
+            with pyro.poutine.scale(scale=kl_weight):
+                pyro.sample("latent_z", dist.Normal(mu, sigma).to_event(1))
+
+    CYCLE_LENGTH = 1000
+    optimizer_args = {"optimizer": torch.optim.AdamW, "optim_args": {"lr": 0.001, "weight_decay": 0.0001}}
+    scheduler = PyroLRScheduler(
+        lambda opt: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=CYCLE_LENGTH, T_mult=1, eta_min=0.0001),
+        optimizer_args,
+    )
+    svi = SVI(local_model_fn, local_guide_fn, scheduler, loss=Trace_ELBO())
+
+    metrics_log_path = os.path.join(output_dir, "metrics_log.csv")
+    metrics_records = []
+
+    total_size = len(train_loader.dataset)
+    ramp_epochs, down_epoch, max_beta = 500, 1000, 0.6
+
+    # 4. Training Loop
+    for epoch in range(1, epochs + 1):
+        rel_epoch = (epoch - 1) % CYCLE_LENGTH
+        if rel_epoch < ramp_epochs:
+            current_kl = max(0.00001, (rel_epoch / ramp_epochs) * max_beta)
+        elif rel_epoch < down_epoch:
+            current_kl = max_beta
+        else:
+            current_kl = 0.00001
+
+        for x_g_b, x_l_b, y_b in train_loader:
+            svi.step(x_g_b.to(device), x_l_b.to(device), y_b.to(device),
+                     total_size=total_size, kl_weight=current_kl)
+
+        scheduler.step()
+
+        # Evaluate and save at step 1000 intervals
+        if epoch % 1000 == 0 or epoch == epochs:
+            rmse, mae, mape = evaluate_metrics(model, val_loader, scaler_y, device, n_samples=50)
+            print(f"[{run_id}] Epoch {epoch:04d} -> RMSE: {rmse:.3f} | MAE: {mae:.3f} | MAPE: {mape:.2f}%")
+
+            # Save metrics row
+            record = {"epoch": epoch, "rmse": rmse, "mae": mae, "mape": mape}
+            metrics_records.append(record)
+            pd.DataFrame(metrics_records).to_csv(metrics_log_path, index=False)
+
+            # Save models and scalers into the dedicated object directory
+            torch.save(model.state_dict(), os.path.join(output_dir, f"model_epoch_{epoch}.pt"))
+            joblib.dump(scaler_y, os.path.join(output_dir, f"scaler_epoch_{epoch}.pkl"))
+
+    print(f"[{run_id}] Training completed successfully.")
+
+
+# ==========================================
+# 8.  TRAINING & 9. AGGREGATE INFERENCE
+# ==========================================
 if __name__ == "__main__":
     from pyro.optim import PyroLRScheduler
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    file_path = "D60_2025_1-6.csv"
-    x_global_all, x_local_all, y_all, scaler_y, y_raw = process_raw_data(file_path)
+    # Paths: Compatible with CSV, XLSX, or XLS
+    train_file_path = "samples/train_trips.csv"
+    val_file_path   = "samples/validation_trips.csv"
+    
+    # Process training data & fit y scaler
+    x_global_train, x_local_train, y_train, scaler_y, _ = process_raw_data(train_file_path)
 
-    idx = np.arange(x_global_all.shape[0])
-    train_idx, val_idx = train_test_split(idx, test_size=0.0000001, random_state=42)
-
-    x_global_train = x_global_all[train_idx]
-    x_local_train  = x_local_all[train_idx]
-    y_train        = y_all[train_idx]
-
-    x_global_val = x_global_all[val_idx].to(device)
-    x_local_val  = x_local_all[val_idx].to(device)
-    y_val        = y_all[val_idx].to(device)
+    has_val_file = os.path.exists(val_file_path)
+    
+    if has_val_file:
+        x_global_val, x_local_val, y_val, _, _ = process_raw_data(val_file_path, scaler_y=scaler_y)
+        val_dataset = TensorDataset(x_global_val, x_local_val, y_val)
+        val_loader  = DataLoader(val_dataset, batch_size=256, shuffle=False)
+    else:
+        print(f"Warning: Validation file '{val_file_path}' not found! Split will be made from training set.")
+        idx = np.arange(x_global_train.shape[0])
+        train_idx, val_idx = train_test_split(idx, test_size=0.1, random_state=42)
+        x_global_val, x_local_val, y_val = x_global_train[val_idx], x_local_train[val_idx], y_train[val_idx]
+        x_global_train, x_local_train, y_train = x_global_train[train_idx], x_local_train[train_idx], y_train[train_idx]
+        val_dataset = TensorDataset(x_global_val, x_local_val, y_val)
+        val_loader  = DataLoader(val_dataset, batch_size=256, shuffle=False)
+    
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -645,83 +824,26 @@ if __name__ == "__main__":
             current_lr = list(scheduler.optim_objs.values())[0].optimizer.param_groups[0]["lr"] if scheduler.optim_objs else 0.002
             avg_loss = epoch_loss / len(train_loader)
             print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {ll:.2f} | KL: {kl:.2f}")
+            
+        # Run Validation & Save Checkpoint every 1000 epochs (and final epoch)
+        if epoch % 1000 == 0 or epoch == epochs:
+            print(f"\n{'='*25} VALIDATION @ EPOCH {epoch} {'='*25}")
+            rmse, mae, mape = evaluate_metrics(bnn_model, val_loader, scaler_y, device, n_samples=50)
+            print(f"Validation RMSE : {rmse:.3f}s")
+            print(f"Validation MAE  : {mae:.3f}s")
+            print(f"Validation MAPE : {mape:.2f}%")
+            print(f"{'='*68}\n")
+
+            # Save model checkpoint and scaler every 1000 epochs
+            model_save_path = f"vae_model_epoch_{epoch}.pt"
+            scaler_save_path = f"y_scaler_epoch_{epoch}.pkl"
+            torch.save(bnn_model.state_dict(), model_save_path)
+            joblib.dump(scaler_y, scaler_save_path)
+            print(f"Checkpoint saved: {model_save_path} and {scaler_save_path}\n")
+
+    print("\nTraining complete.")
 
     #pyro.get_param_store().save("ghost_bus_vae_aggregate.pt")
-    torch.save(bnn_model.state_dict(), "2025_Jan_Jun_vae_ft_student_t_0.7_WMATA_D60.pt")
-    joblib.dump(scaler_y, "y_scaler_vae_student_t_2025_Jan_Jun_WMATA_D60.pkl")
+    torch.save(bnn_model.state_dict(), "2024_Jul_Dec_vae_ft_student_t_0.7_WMATA_D40.pt")
+    joblib.dump(scaler_y, "y_scaler_vae_student_t_2024_Jul_Dec_WMATA_D40.pkl")
     print("\nModel weights and scaler saved successfully.")
-
-    # ==========================================
-    # 9. CORRECTED INFERENCE (Aggregate)
-    # ==========================================
-    bnn_model.eval()
-
-    def predict_mc_aggregate(x_global, x_local, n_samples=200):
-        all_samples = []
-        with torch.no_grad():
-            mu, logvar = bnn_model.encoder(x_global, x_local)
-            sigma = torch.exp(0.5 * logvar)                       
-
-            for _ in range(n_samples):
-                eps = torch.randn_like(mu) 
-                z   = mu + eps * sigma
-
-                # 取得動態學到的 a_e, b_t, df
-                a_e, b_t, df = bnn_model.decoder(z, x_global)
-
-                # 從 StudentT 取樣
-                obs_dist = torch.distributions.StudentT(
-                    df=df.squeeze(-1),
-                    loc=a_e.squeeze(-1),
-                    scale=b_t.squeeze(-1),
-                )
-                all_samples.append(obs_dist.sample()) 
-                
-        bnn_model.eval()        
-        return torch.stack(all_samples, dim=0)
-
-    list_of_predict = []
-    list_of_actual  = []
-    within_bound_count = 0
-    error_abs_total = error_total = 0
-
-    print("\n--- Starting Final Evaluation ---")
-    for j in range(len(x_global_val)):
-        val_x_g = x_global_val[j:j+1]
-        val_x_l = x_local_val[j:j+1]
-        
-        # MC Sampling
-        samples = predict_mc_aggregate(val_x_g, val_x_l, n_samples=200) # shape: [200, 1]
-        
-        pred_mean_scaled = samples.mean().item()
-        pred_std_scaled  = samples.std().item()
-        actual_scaled    = y_val[j].item()
-
-        # Inverse Transform
-        pred_real = scaler_y.inverse_transform([[pred_mean_scaled]])[0][0]
-        actual_real = scaler_y.inverse_transform([[actual_scaled]])[0][0]
-        std_real = pred_std_scaled * scaler_y.scale_[0]
-
-        within = (pred_real - std_real) <= actual_real <= (pred_real + std_real)
-        if within:
-            within_bound_count += 1
-
-        error_total += (actual_real - pred_real)
-        error_abs_total += abs(actual_real - pred_real)
-        
-        list_of_predict.append(pred_real)
-        list_of_actual.append(actual_real)
-        
-        print(f"\n--- Sample {j} ---")
-        print(f"Total ETA: {pred_real:.2f}s  (Actual: {actual_real:.2f}s)")
-        print(f"Confidence: ±{std_real:.2f}s | Within CI? {'YES' if within else 'NO'}")
-        print(f"MAE so far: {error_abs_total/(j+1):.2f}s | Bias: {error_total/(j+1):.2f}s")
-        print(f"Prediction Std Deviation: {np.std(list_of_predict):.2f} | Actual Std Deviation: {np.std(list_of_actual):.2f}")
-        print(f"總共 {j+1} 筆，{within_bound_count} 筆落在區間內")
-
-    print("\n" + "="*60)
-    print(f"SUMMARY  ({len(x_global_val)} trips, 200 MC samples)")
-    print("="*60)
-    print(f"  Trip-level within CI : {within_bound_count}/{len(x_global_val)} ({(within_bound_count/len(x_global_val))*100:.1f}%)")
-    print(f"  Final MAE            : {error_abs_total/len(x_global_val):.2f}s")
-    print(f"  Final Bias           : {error_total/len(x_global_val):.2f}s")

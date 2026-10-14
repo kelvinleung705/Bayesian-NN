@@ -17,7 +17,7 @@ from sklearn.model_selection import train_test_split
 from pyro.optim import ExponentialLR
 import joblib
 
-num_segment = 13
+num_segment = 10
 LATENT_DIM = 64   # z ∈ ℝ³²
 
 # ==========================================
@@ -616,7 +616,7 @@ if __name__ == "__main__":
 
     ramp_epochs = 500
     down_epoch  = 1000
-    max_beta    = 0.7 # 0.6
+    max_beta    = 0.6 # 0.6
 
     for epoch in range(epochs):
         epoch_loss = epoch_ll = epoch_kl = 0.0
@@ -647,7 +647,7 @@ if __name__ == "__main__":
             print(f"Epoch {epoch:05d} | LR: {current_lr:.6f} | KL Wt: {current_kl_weight:.3f} | ELBO Loss: {avg_loss:.2f} | LL: {ll:.2f} | KL: {kl:.2f}")
 
     #pyro.get_param_store().save("ghost_bus_vae_aggregate.pt")
-    torch.save(bnn_model.state_dict(), "2024_Jul_Dec_vae_ft_student_t_0.7_WMATA_D60.pt")
+    torch.save(bnn_model.state_dict(), "2024_Jul_Dec_vae_ft_student_t_0.6_WMATA_D60.pt")
     joblib.dump(scaler_y, "y_scaler_vae_student_t_2024_Jul_Dec_WMATA_D60.pkl")
     print("\nModel weights and scaler saved successfully.")
 
