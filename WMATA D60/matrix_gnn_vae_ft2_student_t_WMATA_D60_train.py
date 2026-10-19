@@ -23,9 +23,20 @@ LATENT_DIM = 64   # z ∈ ℝ³²
 # ==========================================
 # 1. DATA PRE-PROCESSING
 # ==========================================
-def process_raw_data(file_path):
+def process_raw_data(file_path, scaler_y=None):
+    """
+    Reads either .csv, .xlsx, or .xls files.
+    If scaler_y is provided, transforms y using it (useful for validation).
+    Otherwise, fits a new StandardScaler.
+    """
     print(f"Reading {file_path}...")
-    df = pd.read_csv(file_path, header=None, skiprows=1)
+    ext = os.path.splitext(file_path)[-1].lower()
+    if ext in ['.xlsx', '.xls']:
+        df = pd.read_excel(file_path, header=None, skiprows=1)
+    elif ext == '.csv':
+        df = pd.read_csv(file_path, header=None, skiprows=1)
+    else:
+        raise ValueError(f"Unsupported file format: {ext}. Must be .csv, .xlsx, or .xls")
 
     end = 9 + num_segment + 1 + (num_segment * 4) + 2
     df_subset = df.iloc[:, 0:end]
@@ -36,20 +47,24 @@ def process_raw_data(file_path):
     raw_data_np = df_subset.values.astype(np.float32)
 
     x_global = torch.tensor(raw_data_np[:, 0:9], dtype=torch.float32)
-    raw_local = raw_data_np[:, 9+num_segment+1:9+num_segment+1+(num_segment*4)]
+    raw_local = raw_data_np[:, 9 + num_segment + 1 : 9 + num_segment + 1 + (num_segment * 4)]
     x_local = torch.tensor(raw_local.reshape(-1, num_segment, 4), dtype=torch.float32)
 
-    y_raw = raw_data_np[:, 9 : 9+num_segment].sum(axis=1)
-    print(y_raw)
+    y_raw = raw_data_np[:, 9 : 9 + num_segment].sum(axis=1)
     y_raw_2d = y_raw.reshape(-1, 1)
-    scaler_y = StandardScaler()
-    y_scaled_2d = scaler_y.fit_transform(y_raw_2d)
+
+    if scaler_y is None:
+        scaler_y = StandardScaler()
+        y_scaled_2d = scaler_y.fit_transform(y_raw_2d)
+    else:
+        y_scaled_2d = scaler_y.transform(y_raw_2d)
+
     y_scaled = torch.tensor(y_scaled_2d, dtype=torch.float32).squeeze(-1)
 
-    print("Total rows loaded:", raw_data_np.shape[0])
-    print("y_raw mean:", y_raw.mean())
-    print("y_raw std:", y_raw.std())
+    print(f"Loaded {raw_data_np.shape[0]} rows from {file_path}")
+    print(f"y_raw mean: {y_raw.mean():.2f} | y_raw std: {y_raw.std():.2f}")
     return x_global, x_local, y_scaled, scaler_y, y_raw
+
 
 
 # ==========================================
@@ -530,6 +545,62 @@ def get_ll_kl(model_fn, guide_fn, x_g, x_l, y, total_size):
     return ll, kl
 
 
+
+def evaluate_metrics(model, val_loader, scaler_y, device, n_samples=50):
+    """
+    Evaluates the model on validation data across MC samples.
+    Calculates RMSE, MAE, and MAPE on the real-world scale (unscaled seconds).
+    """
+    model.eval()
+    all_preds = []
+    all_actuals = []
+
+    with torch.no_grad():
+        for x_g_b, x_l_b, y_b in val_loader:
+            x_g_b = x_g_b.to(device)
+            x_l_b = x_l_b.to(device)
+
+            mu, logvar = model.encoder(x_g_b, x_l_b)
+            sigma = torch.exp(0.5 * logvar)
+
+            # MC sampling over the batch
+            batch_samples = []
+            for _ in range(n_samples):
+                eps = torch.randn_like(mu)
+                z = mu + eps * sigma
+                a_e, b_t, df = model.decoder(z, x_g_b)
+                obs_dist = torch.distributions.StudentT(
+                    df=df.squeeze(-1),
+                    loc=a_e.squeeze(-1),
+                    scale=b_t.squeeze(-1)
+                )
+                batch_samples.append(obs_dist.sample())
+
+            # Mean across samples -> [B]
+            pred_scaled_batch = torch.stack(batch_samples, dim=0).mean(dim=0).cpu().numpy()
+            y_actual_batch = y_b.numpy()
+
+            all_preds.extend(pred_scaled_batch)
+            all_actuals.extend(y_actual_batch)
+
+    model.train()
+
+    preds_scaled = np.array(all_preds).reshape(-1, 1)
+    actuals_scaled = np.array(all_actuals).reshape(-1, 1)
+
+    # Invert back to seconds
+    preds_real = scaler_y.inverse_transform(preds_scaled).ravel()
+    actuals_real = scaler_y.inverse_transform(actuals_scaled).ravel()
+
+    # Calculate metrics
+    mae = np.mean(np.abs(actuals_real - preds_real))
+    rmse = np.sqrt(np.mean((actuals_real - preds_real) ** 2))
+    # Epsilon prevents divide-by-zero
+    mape = np.mean(np.abs((actuals_real - preds_real) / np.clip(np.abs(actuals_real), 1e-6, None))) * 100.0
+
+    return rmse, mae, mape
+
+
 # ==========================================
 # 8.  TRAINING  (identical SVI loop)
 # ==========================================
@@ -555,6 +626,7 @@ def train_single_run(
     output_dir,
     epochs=4000,
     batch_size=734,
+    delta = 0.6,
     device_name="cuda",
 ):
     """
@@ -625,7 +697,7 @@ def train_single_run(
     metrics_records = []
 
     total_size = len(train_loader.dataset)
-    ramp_epochs, down_epoch, max_beta = 500, 1000, 0.6
+    ramp_epochs, down_epoch, max_beta = 500, 1000, delta
 
     # 4. Training Loop
     for epoch in range(1, epochs + 1):

@@ -16,9 +16,14 @@ from sklearn.metrics import (
 # ==========================================
 # PARAMS_PATH  = "2024_Jul_Dec_vae_ft_student_t_0.6_TTC_927.pt"
 # SCALER_PATH  = "y_scaler_vae_student_t_0.6_2024_Jul_Dec_TTC_927.pkl"
+"""
 PARAMS_PATH = "vae_model_epoch_3000.pt"
 SCALER_PATH = "y_scaler_epoch_3000.pkl"
 DATA_PATH = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_Jan_Jun.xlsx"
+"""
+PARAMS_PATH = "results_0.7/experiment_Phrase_1_2025_1-2025_6/model_epoch_2000.pt"
+SCALER_PATH = "results_0.7/experiment_Phrase_1_2025_1-2025_6/scaler_epoch_2000.pkl"
+DATA_PATH = "samples/TTC_927_Period_1_test.csv"
 
 NUM_SEGMENT = 9
 GLOBAL_DIM = 9

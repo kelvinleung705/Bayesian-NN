@@ -24,9 +24,20 @@ LATENT_DIM = 64   # z ∈ ℝ³²
 # ==========================================
 # 1. DATA PRE-PROCESSING
 # ==========================================
-def process_raw_data(file_path):
+def process_raw_data(file_path, scaler_y=None):
+    """
+    Reads either .csv, .xlsx, or .xls files.
+    If scaler_y is provided, transforms y using it (useful for validation).
+    Otherwise, fits a new StandardScaler.
+    """
     print(f"Reading {file_path}...")
-    df = pd.read_csv(file_path, header=None, skiprows=1)
+    ext = os.path.splitext(file_path)[-1].lower()
+    if ext in ['.xlsx', '.xls']:
+        df = pd.read_excel(file_path, header=None, skiprows=1)
+    elif ext == '.csv':
+        df = pd.read_csv(file_path, header=None, skiprows=1)
+    else:
+        raise ValueError(f"Unsupported file format: {ext}. Must be .csv, .xlsx, or .xls")
 
     end = 9 + num_segment + 1 + (num_segment * 4) + 2
     df_subset = df.iloc[:, 0:end]
@@ -37,19 +48,22 @@ def process_raw_data(file_path):
     raw_data_np = df_subset.values.astype(np.float32)
 
     x_global = torch.tensor(raw_data_np[:, 0:9], dtype=torch.float32)
-    raw_local = raw_data_np[:, 9+num_segment+1:9+num_segment+1+(num_segment*4)]
+    raw_local = raw_data_np[:, 9 + num_segment + 1 : 9 + num_segment + 1 + (num_segment * 4)]
     x_local = torch.tensor(raw_local.reshape(-1, num_segment, 4), dtype=torch.float32)
 
-    y_raw = raw_data_np[:, 9 : 9+num_segment].sum(axis=1)
-    print(y_raw)
+    y_raw = raw_data_np[:, 9 : 9 + num_segment].sum(axis=1)
     y_raw_2d = y_raw.reshape(-1, 1)
-    scaler_y = StandardScaler()
-    y_scaled_2d = scaler_y.fit_transform(y_raw_2d)
+
+    if scaler_y is None:
+        scaler_y = StandardScaler()
+        y_scaled_2d = scaler_y.fit_transform(y_raw_2d)
+    else:
+        y_scaled_2d = scaler_y.transform(y_raw_2d)
+
     y_scaled = torch.tensor(y_scaled_2d, dtype=torch.float32).squeeze(-1)
 
-    print("Total rows loaded:", raw_data_np.shape[0])
-    print("y_raw mean:", y_raw.mean())
-    print("y_raw std:", y_raw.std())
+    print(f"Loaded {raw_data_np.shape[0]} rows from {file_path}")
+    print(f"y_raw mean: {y_raw.mean():.2f} | y_raw std: {y_raw.std():.2f}")
     return x_global, x_local, y_scaled, scaler_y, y_raw
 
 
@@ -531,86 +545,75 @@ def get_ll_kl(model_fn, guide_fn, x_g, x_l, y, total_size):
     return ll, kl
 
 
+def evaluate_metrics(model, val_loader, scaler_y, device, n_samples=50):
+    """
+    Evaluates the model on validation data across MC samples.
+    Calculates RMSE, MAE, and MAPE on the real-world scale (unscaled seconds).
+    """
+    model.eval()
+    all_preds = []
+    all_actuals = []
+
+    with torch.no_grad():
+        for x_g_b, x_l_b, y_b in val_loader:
+            x_g_b = x_g_b.to(device)
+            x_l_b = x_l_b.to(device)
+
+            mu, logvar = model.encoder(x_g_b, x_l_b)
+            sigma = torch.exp(0.5 * logvar)
+
+            # MC sampling over the batch
+            batch_samples = []
+            for _ in range(n_samples):
+                eps = torch.randn_like(mu)
+                z = mu + eps * sigma
+                a_e, b_t, df = model.decoder(z, x_g_b)
+                obs_dist = torch.distributions.StudentT(
+                    df=df.squeeze(-1),
+                    loc=a_e.squeeze(-1),
+                    scale=b_t.squeeze(-1)
+                )
+                batch_samples.append(obs_dist.sample())
+
+            # Mean across samples -> [B]
+            pred_scaled_batch = torch.stack(batch_samples, dim=0).mean(dim=0).cpu().numpy()
+            y_actual_batch = y_b.numpy()
+
+            all_preds.extend(pred_scaled_batch)
+            all_actuals.extend(y_actual_batch)
+
+    model.train()
+
+    preds_scaled = np.array(all_preds).reshape(-1, 1)
+    actuals_scaled = np.array(all_actuals).reshape(-1, 1)
+
+    # Invert back to seconds
+    preds_real = scaler_y.inverse_transform(preds_scaled).ravel()
+    actuals_real = scaler_y.inverse_transform(actuals_scaled).ravel()
+
+    # Calculate metrics
+    mae = np.mean(np.abs(actuals_real - preds_real))
+    rmse = np.sqrt(np.mean((actuals_real - preds_real) ** 2))
+    # Epsilon prevents divide-by-zero
+    mape = np.mean(np.abs((actuals_real - preds_real) / np.clip(np.abs(actuals_real), 1e-6, None))) * 100.0
+
+    return rmse, mae, mape
+
+
 # ==========================================
 # 8.  TRAINING  (identical SVI loop)
 # ==========================================
-
-
-def test_model(model, test_dataloader, device, edge, node, A):
-    predicts_list = []
-    label_list = []
-    nll_list = []
-    crps_list = []
-    model.eval()
-    edge = torch.FloatTensor(edge).to(device)
-    node = torch.FloatTensor(node).to(device)
-    A = torch.LongTensor(A).to(device)
-
-    with torch.no_grad():
-        for batch in tqdm(test_dataloader):
-            route, mask, f, label = zip(*batch)
-            route = torch.LongTensor(route).to(device)
-            mask = torch.LongTensor(mask).to(device)
-            f = torch.FloatTensor(f).to(device)
-            # Ensure label is (B, 1) on device in seconds
-            label_sec = torch.FloatTensor(label).to(device).view(-1, 1)
-
-            # Model was trained on minutes, so feed label in minutes
-            pi, mu, sigma = model.forward(route, mask, f, edge, node, A, label_sec / 60.0, 'test')
-
-            # Convert distribution parameters to seconds
-            mu_sec = mu * 60.0
-            sigma_sec = sigma * 60.0
-
-            # 1. Prediction (expected value in seconds)
-            pred = torch.sum(mu_sec * pi, dim=1)  # shape: (B,)
-
-            # 2. Correct GMM Negative Log-Likelihood in seconds
-            m = torch.distributions.Normal(loc=mu_sec, scale=sigma_sec)
-            log_component_prob = m.log_prob(label_sec)  # shape: (B, K)
-            log_pi = torch.log(torch.clamp(pi, min=1e-8))
-            # log(sum_k pi_k * N_k)
-            log_likelihood = torch.logsumexp(log_pi + log_component_prob, dim=-1)  # shape: (B,)
-            batch_nll = -torch.mean(log_likelihood)
-            nll_list.append(batch_nll.item())  # Store scalar float
-
-            # 3. CRPS calculation (in seconds)
-            crps_metric = CRPSMetric(label_sec, mu_sec, sigma_sec)
-            get_crps = crps_metric.gaussian_crps()
-            crps = torch.sum(torch.mul(get_crps, pi), dim=1)
-            crps_list.append(crps.mean().item())  # Store scalar float
-
-            # Collect predictions and labels
-            predicts_list.extend(pred.view(-1).cpu().tolist())
-            label_list.extend(label_sec.view(-1).cpu().tolist())
-
-        predicts = np.array(predicts_list)
-        labels = np.array(label_list)
-        val_nll = np.mean(nll_list)
-        val_crps = np.mean(crps_list)
-
-        from sklearn.metrics import mean_absolute_error as mae
-
-        # 1. MAE
-        val_mae = mae(labels, predicts)
-        print("Labels[:10]:", labels[:10])
-        print("Preds[:10]: ", predicts[:10])
-
-        # 2. RMSE
-        val_rmse = np.sqrt(np.mean((labels - predicts) ** 2))
-
-        # 3. Safe MAPE
-        valid_mask = labels > 1e-2
-        val_mape = np.mean(np.abs((labels[valid_mask] - predicts[valid_mask]) / labels[valid_mask])) if np.sum(valid_mask) > 0 else 0.0
-
-        # Print outputs
-        print(f'mae: {val_mae:.4f}')
-        print(f'rmse: {val_rmse:.4f}')
-        print(f'mape: {val_mape:.4f} ({val_mape * 100:.2f}%)')
-        print(f'negative-log-likelihood: {val_nll:.4f}')
-        print(f'CRPS: {val_crps:.4f}')
-
-        return val_mae, val_mape, val_nll, val_crps
+    
+import os
+import joblib
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+import pyro
+from pyro.infer import SVI, Trace_ELBO
+from pyro.optim import PyroLRScheduler
 
 def train_single_run(
     run_id,
@@ -619,6 +622,7 @@ def train_single_run(
     output_dir,
     epochs=4000,
     batch_size=734,
+    delta = 0.6,
     device_name="cuda",
 ):
     """
@@ -689,7 +693,7 @@ def train_single_run(
     metrics_records = []
 
     total_size = len(train_loader.dataset)
-    ramp_epochs, down_epoch, max_beta = 500, 1000, 0.6
+    ramp_epochs, down_epoch, max_beta = 500, 1000, delta
 
     # 4. Training Loop
     for epoch in range(1, epochs + 1):

@@ -444,6 +444,7 @@ def train_single_run(
     output_dir,
     epochs=4000,
     batch_size=734,
+    delta=0.6,
     device_name="cuda",
 ):
     """
@@ -514,7 +515,7 @@ def train_single_run(
     metrics_records = []
 
     total_size = len(train_loader.dataset)
-    ramp_epochs, down_epoch, max_beta = 500, 1000, 0.6
+    ramp_epochs, down_epoch, max_beta = 500, 1000, delta
 
     # 4. Training Loop
     for epoch in range(1, epochs + 1):

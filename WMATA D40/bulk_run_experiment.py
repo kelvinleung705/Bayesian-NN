@@ -22,28 +22,31 @@ if __name__ == "__main__":
     tasks = [
         {
             "run_id": "Dataset_Group_Phrase_1",
-            "train_file": "samples/train_A.csv",
-            "val_file": "samples/val_A.csv",
-            "output_dir": "results/experiment_Phrase_1",
+            "train_file": "samples/D40_Period_1_train.csv",
+            "val_file": "samples/D40_Period_1_validation.csv",
+            "output_dir": "results_0.6/experiment_Phrase_1_2024_1-2024_6",
             "epochs": 4000,
+            "delta": 0.6,
             "device": "cuda:0", # Change to "cpu" or another GPU ID if needed
         },
         {
             "run_id": "Dataset_Group_Phrase_2",
-            "train_file": "samples/train_B.csv",
-            "val_file": "samples/val_B.csv",
-            "output_dir": "results/experiment_Phrase_2",
+            "train_file": "samples/D40_Period_2_train.csv",
+            "val_file": "samples/D40_Period_2_validation.csv",
+            "output_dir": "results_0.6/experiment_Phrase_2_2024_7-2024_12",
             "epochs": 4000,
+            "delta": 0.6,
             "device": "cuda:0",
         },
         {
             "run_id": "Dataset_Group_Phrase_3",
-            "train_file": "samples/train_C.xlsx",
-            "val_file": "samples/val_C.xlsx",
-            "output_dir": "results/experiment_Phrase_3",
+            "train_file": "samples/D40_Period_3_train.csv",
+            "val_file": "samples/D40_Period_3_validation.csv",
+            "output_dir": "results_0.6/experiment_Phrase_3_2025_1-2025_6",
             "epochs": 4000,
+            "delta": 0.6,
             "device": "cuda:0",
-        },
+        }
     ]
 
     # Set maximum simultaneous workers (e.g. 2 or 3 parallel runs)

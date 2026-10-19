@@ -24,11 +24,14 @@ HIDDEN_DIM = 64
 LATENT_DIM = 64
 MC_SAMPLES = 200
 INFER_BATCH = 512
-
+"""
 PARAMS_PATH = "2024_Jul_Dec_vae_ft_student_t_0.6_WMATA_D60.pt"
 SCALER_PATH = "y_scaler_vae_student_t_2024_Jul_Dec_WMATA_D60.pkl"
 DATA_PATH = "D60_2025_1-6.csv"
-
+"""
+PARAMS_PATH = "results_0.7/experiment_Phrase_3_2025_1-2025_6/model_epoch_2000.pt"
+SCALER_PATH = "results_0.7/experiment_Phrase_3_2025_1-2025_6/scaler_epoch_2000.pkl"
+DATA_PATH = "samples/D60_Period_3_test.csv"
 
 class LocalIsolationLayer(nn.Module):
 
