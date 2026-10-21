@@ -21,9 +21,9 @@ PARAMS_PATH = "vae_model_epoch_3000.pt"
 SCALER_PATH = "y_scaler_epoch_3000.pkl"
 DATA_PATH = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_Jan_Jun.xlsx"
 """
-PARAMS_PATH = "results_0.7/experiment_Phrase_1_2025_1-2025_6/model_epoch_2000.pt"
-SCALER_PATH = "results_0.7/experiment_Phrase_1_2025_1-2025_6/scaler_epoch_2000.pkl"
-DATA_PATH = "samples/TTC_927_Period_1_test.csv"
+PARAMS_PATH = "results_0.6_1000/experiment_Phrase_3_2026_1-2026_6/model_epoch_4000.pt"
+SCALER_PATH = "results_0.6_1000/experiment_Phrase_3_2026_1-2026_6/scaler_epoch_4000.pkl"
+DATA_PATH = "samples/TTC_927_Period_3_test.csv"
 
 NUM_SEGMENT = 9
 GLOBAL_DIM = 9
@@ -404,13 +404,19 @@ def run_inference_fast(
 
       # 3. 偶然不確定性 (Student-t Aleatoric Variance: E[Var(Y|z)])
       # 對於 Student-t(nu, loc, scale)，Var = scale^2 * (nu / (nu - 2))
-      student_t_sample_vars = (mc_scales ** 2) * (
+      """
+      student_t_sample_vars = (mc_scales ** 1) * (
           mc_dfs / (mc_dfs - 2.0).clamp(min=1e-4)
       )
       aleatoric_var = student_t_sample_vars.mean(dim=0)
-
-      # 4. 總不確定性標準差 (總變異數開根號)
       total_std = torch.sqrt(epistemic_var + aleatoric_var)
+      """
+      # ✔️ 與訓練腳本 1.00*scale 對齊的標準寫法：
+      mean_scale = mc_scales.mean(dim=0)
+      # 若想保留 MC-Dropout 認識不確定性，可開根號相加；若想完全對齊訓練腳本，直接等於 mean_scale
+      total_std = mean_scale * 1.00
+      # 4. 總不確定性標準差 (總變異數開根號)
+      
 
       pred_means[start:end] = final_eta.cpu().numpy()
       pred_stds[start:end] = total_std.cpu().numpy()
@@ -548,6 +554,7 @@ if __name__ == "__main__":
   x_local_val = x_local_all.to(device)
 
   model = load_model(args.params, device)
+  """
   run_inference_fast(
       x_global_val,
       x_local_val,
@@ -558,4 +565,16 @@ if __name__ == "__main__":
       mc_samples=args.mc,
       batch_size=args.batch,
       use_mc_dropout=(not args.no_dropout),
+  )
+  """
+  run_inference_fast(
+      x_global_val,
+      x_local_val,
+      y_raw,
+      model,
+      scaler_y,
+      device,
+      mc_samples=args.mc,
+      batch_size=args.batch,
+      use_mc_dropout=True,
   )

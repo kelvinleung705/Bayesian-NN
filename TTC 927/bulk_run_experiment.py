@@ -17,15 +17,14 @@ def worker_task(config):
 if __name__ == "__main__":
     # Required for PyTorch multiprocessing across CUDA/CPUs
     mp.set_start_method("spawn", force=True)
-
     # Define your different dataset runs and dedicated save directories
     tasks = [
         {
             "run_id": "Dataset_Group_Phrase_1",
             "train_file": "samples/TTC_927_Period_1_train.csv",
             "val_file": "samples/TTC_927_Period_1_validation.csv",
-            "output_dir": "results_0.6/experiment_Phrase_1_2025_1-2025_6",
-            "epochs": 5000,
+            "output_dir": "results_0.6_1000/experiment_Phrase_1_2025_1-2025_6",
+            "epochs": 6000,
             "delta": 0.6,
             "device": "cuda:0", # Change to "cpu" or another GPU ID if needed
         },
@@ -33,8 +32,8 @@ if __name__ == "__main__":
             "run_id": "Dataset_Group_Phrase_2",
             "train_file": "samples/TTC_927_Period_2_train.csv",
             "val_file": "samples/TTC_927_Period_2_validation.csv",
-            "output_dir": "results_0.6/experiment_Phrase_2_2025_7-2025_12",
-            "epochs": 5000,
+            "output_dir": "results_0.6_1000/experiment_Phrase_2_2025_7-2025_12",
+            "epochs": 6000,
             "delta": 0.6,
             "device": "cuda:0",
         },
@@ -42,8 +41,8 @@ if __name__ == "__main__":
             "run_id": "Dataset_Group_Phrase_3",
             "train_file": "samples/TTC_927_Period_3_train.csv",
             "val_file": "samples/TTC_927_Period_3_validation.csv",
-            "output_dir": "results_0.6/experiment_Phrase_3_2026_1-2026_6",
-            "epochs": 5000,
+            "output_dir": "results_0.6_1000/experiment_Phrase_3_2026_1-2026_6",
+            "epochs": 6000,
             "delta": 0.6,
             "device": "cuda:0",
         },

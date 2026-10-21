@@ -268,7 +268,8 @@ class DecoderTheta(nn.Module):
         b_t = torch.exp(0.5 * torch.clamp(b_e, min=-10.0, max=10.0)) + 1e-3
 
         df_e = self.heads_df(h_b)
-        nu = torch.nn.functional.softplus(df_e) + 2.05
+        #nu = torch.nn.functional.softplus(df_e) + 2.05
+        nu = 4.1 + 13 * torch.sigmoid(df_e)
 
         return (a_e, b_t, nu)
 
@@ -369,58 +370,114 @@ def get_ll_kl(x_g, x_l, y):
 
 
 def evaluate_metrics(model, val_loader, scaler_y, device, n_samples=50):
-    """
-    Evaluates the model on validation data across MC samples.
-    Calculates RMSE, MAE, and MAPE on the real-world scale (unscaled seconds).
-    """
     model.eval()
     all_preds = []
     all_actuals = []
+    total_nll = 0.0
+    total_crps = 0.0
+    total_samples_count = 0
+    within_ci_count = 0
+
+    # 取得原始尺度轉換所需的乘數 (標準差)
+    scaler_mean_t = torch.tensor(scaler_y.mean_[0], device=device, dtype=torch.float32)
+    scaler_scale_t = torch.tensor(scaler_y.scale_[0], device=device, dtype=torch.float32)
+    scale_factor = scaler_y.scale_[0]
 
     with torch.no_grad():
         for x_g_b, x_l_b, y_b in val_loader:
             x_g_b = x_g_b.to(device)
             x_l_b = x_l_b.to(device)
+            y_b = y_b.to(device)
+            B = y_b.size(0)
 
             mu, logvar = model.encoder(x_g_b, x_l_b)
             sigma = torch.exp(0.5 * logvar)
 
-            # MC sampling over the batch
-            batch_samples = []
+            # MC 採樣計算分佈特徵
+            batch_locs, batch_scales, batch_dfs = [], [], []
+            batch_y_samples = []  # 用於 CRPS 計算的採樣值
             for _ in range(n_samples):
                 eps = torch.randn_like(mu)
                 z = mu + eps * sigma
                 a_e, b_t, df = model.decoder(z, x_g_b)
-                obs_dist = torch.distributions.StudentT(
-                    df=df.squeeze(-1),
-                    loc=a_e.squeeze(-1),
-                    scale=b_t.squeeze(-1)
+                
+                loc_i = a_e.squeeze(-1)
+                scale_i = b_t.squeeze(-1)
+                df_i = df.squeeze(-1)
+
+                batch_locs.append(loc_i)
+                batch_scales.append(scale_i)
+                batch_dfs.append(df_i)
+
+                # 從預測的 Student-t 分佈中抽樣出具體的可能時間 y
+                dist_sample = torch.distributions.StudentT(
+                    df=df_i, loc=loc_i, scale=scale_i
                 )
-                batch_samples.append(obs_dist.sample())
+                batch_y_samples.append(dist_sample.sample())
 
-            # Mean across samples -> [B]
-            pred_scaled_batch = torch.stack(batch_samples, dim=0).mean(dim=0).cpu().numpy()
-            y_actual_batch = y_b.numpy()
+            
+            # ----------------------------------------------------
+            # 1. 計算 CRPS (在真實秒數空間中向量化高速計算)
+            # ----------------------------------------------------
+            # y_samples_scaled: [n_samples, B]
+            y_samples_scaled = torch.stack(batch_y_samples, dim=0)
 
-            all_preds.extend(pred_scaled_batch)
-            all_actuals.extend(y_actual_batch)
+            # 還原為真實秒數
+            y_samples_real = (y_samples_scaled * scaler_scale_t + scaler_mean_t)  # [n_samples, B]
+            y_true_real_t = y_b * scaler_scale_t + scaler_mean_t  # [B]
+
+            # Term 1: E|Y_pred - y| (第一項：預測採樣與真實值的平均距離)
+            term1 = torch.abs(y_samples_real - y_true_real_t.unsqueeze(0)).mean(dim=0)  # [B]
+
+            # Term 2: 0.5 * E|Y_pred - Y'_pred| (第二項：預測採樣之間的內部多樣性距離)
+            # 使用 O(M log M) 的排序向量化技巧取代雙重迴圈，運算速度快 100 倍
+            sorted_samples, _ = torch.sort(y_samples_real, dim=0)  # [M, B]
+            M = n_samples
+            idx = torch.arange(M, device=device, dtype=torch.float32).unsqueeze(1)  # [M, 1]
+            weights = 2 * idx - M + 1  # 係數矩陣
+            term2 = (sorted_samples * weights).sum(dim=0) / (M * M)  # [B]
+
+            # 當前 Batch 的平均 CRPS (單位: 秒)
+            batch_crps = term1 - term2
+            total_crps += batch_crps.sum().item()
+            
+            mean_loc = torch.stack(batch_locs).mean(dim=0)
+            mean_scale = torch.stack(batch_scales).mean(dim=0)
+            mean_df = torch.stack(batch_dfs).mean(dim=0)
+
+
+            # 計算 NLL (負對數似然)
+            dist_val = torch.distributions.StudentT(df=mean_df, loc=mean_loc, scale=mean_scale)
+            total_nll += -dist_val.log_prob(y_b).sum().item()
+            total_samples_count += B #y_b.size(0) 
+
+            # 計算 68.3% (1-sigma) CI 覆蓋率 (還原到原始秒數空間)
+            y_real = scaler_y.inverse_transform(y_b.cpu().numpy().reshape(-1, 1)).ravel()
+            pred_real = scaler_y.inverse_transform(mean_loc.cpu().numpy().reshape(-1, 1)).ravel()
+            scale_real = mean_scale.cpu().numpy() * scale_factor
+
+            # Student-t 的 68.3% 區間半寬約為 t_factor * scale
+            # 當 df > 4 時，1-sigma 的臨界值約在 1.05 ~ 1.15 之間
+            ci_half_width = scale_real * 1.00
+            within_ci = (y_real >= (pred_real - ci_half_width)) & (y_real <= (pred_real + ci_half_width))
+            within_ci_count += np.sum(within_ci)
+
+            all_preds.extend(mean_loc.cpu().numpy())
+            all_actuals.extend(y_b.cpu().numpy())
 
     model.train()
 
-    preds_scaled = np.array(all_preds).reshape(-1, 1)
-    actuals_scaled = np.array(all_actuals).reshape(-1, 1)
+    preds_real = scaler_y.inverse_transform(np.array(all_preds).reshape(-1, 1)).ravel()
+    actuals_real = scaler_y.inverse_transform(np.array(all_actuals).reshape(-1, 1)).ravel()
 
-    # Invert back to seconds
-    preds_real = scaler_y.inverse_transform(preds_scaled).ravel()
-    actuals_real = scaler_y.inverse_transform(actuals_scaled).ravel()
-
-    # Calculate metrics
     mae = np.mean(np.abs(actuals_real - preds_real))
     rmse = np.sqrt(np.mean((actuals_real - preds_real) ** 2))
-    # Epsilon prevents divide-by-zero
     mape = np.mean(np.abs((actuals_real - preds_real) / np.clip(np.abs(actuals_real), 1e-6, None))) * 100.0
+    avg_nll = total_nll / total_samples_count
+    coverage = (within_ci_count / total_samples_count) * 100.0
+    avg_crps = total_crps / total_samples_count  # 新增：全局平均 CRPS (秒)
 
-    return rmse, mae, mape
+    return rmse, mae, mape, avg_nll, coverage, avg_crps
 
 
 # Add this function to the bottom of your existing vae_model.py
@@ -535,11 +592,11 @@ def train_single_run(
 
         # Evaluate and save at step 1000 intervals
         if epoch % 1000 == 0 or epoch == epochs:
-            rmse, mae, mape = evaluate_metrics(model, val_loader, scaler_y, device, n_samples=50)
+            rmse, mae, mape, avg_nll, coverage, avg_crps = evaluate_metrics(model, val_loader, scaler_y, device, n_samples=50)
             print(f"[{run_id}] Epoch {epoch:04d} -> RMSE: {rmse:.3f} | MAE: {mae:.3f} | MAPE: {mape:.2f}%")
 
             # Save metrics row
-            record = {"epoch": epoch, "rmse": rmse, "mae": mae, "mape": mape}
+            record = {"epoch": epoch, "rmse": rmse, "mae": mae, "mape": mape, "avg_nll": avg_nll, "coverage": coverage, "avg_crps": avg_crps}
             metrics_records.append(record)
             pd.DataFrame(metrics_records).to_csv(metrics_log_path, index=False)
 
@@ -647,10 +704,13 @@ if __name__ == "__main__":
         # Run Validation & Save Checkpoint every 1000 epochs (and final epoch)
         if epoch % 1000 == 0 or epoch == epochs:
             print(f"\n{'='*25} VALIDATION @ EPOCH {epoch} {'='*25}")
-            rmse, mae, mape = evaluate_metrics(bnn_model, val_loader, scaler_y, device, n_samples=50)
+            rmse, mae, mape, avg_nll, coverage, avg_crps = evaluate_metrics(bnn_model, val_loader, scaler_y, device, n_samples=50)
             print(f"Validation RMSE : {rmse:.3f}s")
             print(f"Validation MAE  : {mae:.3f}s")
             print(f"Validation MAPE : {mape:.2f}%")
+            print(f"Validation NLL  : {avg_nll:.3f}")
+            print(f"Validation Coverage : {coverage:.2f}%")
+            print(f"Validation CRPS : {avg_crps:.3f}")
             print(f"{'='*68}\n")
 
             # Save model checkpoint and scaler every 1000 epochs
