@@ -21,8 +21,8 @@ PARAMS_PATH = "vae_model_epoch_3000.pt"
 SCALER_PATH = "y_scaler_epoch_3000.pkl"
 DATA_PATH = "trip_info_9_section_ver2_simplify_ultra_no_variance_2025_Jan_Jun.xlsx"
 """
-PARAMS_PATH = "results_0.6_1000/experiment_Phrase_3_2026_1-2026_6/model_epoch_4000.pt"
-SCALER_PATH = "results_0.6_1000/experiment_Phrase_3_2026_1-2026_6/scaler_epoch_4000.pkl"
+PARAMS_PATH = "results_0.7/experiment_Phrase_3_2026_1-2026_6/model_epoch_3000.pt"
+SCALER_PATH = "results_0.7/experiment_Phrase_3_2026_1-2026_6/scaler_epoch_3000.pkl"
 DATA_PATH = "samples/TTC_927_Period_3_test.csv"
 
 NUM_SEGMENT = 9
@@ -499,6 +499,8 @@ def _print_results(pred_real, actual_real, std_real, pred_dfs, n, mc_samples):
       " [理論目標: 68.3%]"
   )
   print(f"  平均學到的尾部自由度 (ν)   : {np.mean(pred_dfs):.2f}")
+  print(f"  平均學到的尾部最高自由度 (ν)   : {np.max(pred_dfs):.2f}")
+  print(f"  平均學到的尾部最低自由度 (ν)   : {np.min(pred_dfs):.2f}")
   print(f"  平均絕對誤差 (MAE)         : {mae:.2f} s")
   print(f"  平均絕對百分比誤差 (MAPE)  : {mape:.2f} %")
   print(f"  均方根誤差 (RMSE)          : {rmse:.2f} s")
